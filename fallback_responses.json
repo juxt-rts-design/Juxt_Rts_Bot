@@ -1,0 +1,158 @@
+{
+  "categories": {
+    "developpement_web": {
+      "frontend": {
+        "html": {
+          "questions": ["html", "balise", "structure", "semantique", "doctype", "meta", "head", "body"],
+          "responses": [
+            "HTML (HyperText Markup Language) est le langage de balisage standard pour creer des pages web. Il utilise des balises pour structurer le contenu : <html>, <head>, <body>, <div>, <p>, <h1>-<h6>, <img>, <a>, etc. Chaque page HTML commence par <!DOCTYPE html> et contient des elements semantiques pour une meilleure accessibilite.",
+            "Les balises HTML servent a structurer le contenu : <header> pour l'en-tete, <nav> pour la navigation, <main> pour le contenu principal, <section> pour les sections, <article> pour les articles, <aside> pour les barres laterales, et <footer> pour le pied de page. Cette structure semantique ameliore le SEO et l'accessibilite."
+          ]
+        },
+        "css": {
+          "questions": ["css", "style", "feuille", "selecteur", "propriete", "flexbox", "grid", "responsive", "media query"],
+          "responses": [
+            "CSS (Cascading Style Sheets) controle l'apparence des elements HTML. Il utilise des selecteurs pour cibler les elements : par classe (.classe), par ID (#id), par balise (div), ou par attribut ([attribut]). Les proprietes CSS incluent : color, background, margin, padding, border, display, position, etc.",
+            "Flexbox et Grid sont deux systemes de mise en page modernes. Flexbox est unidimensionnel (ligne ou colonne) avec des proprietes comme display: flex, justify-content, align-items, flex-direction. Grid est bidimensionnel avec display: grid, grid-template-columns, grid-template-rows, grid-area.",
+            "Le design responsive utilise des media queries (@media) pour adapter l'affichage selon la taille d'ecran : @media (max-width: 768px) pour mobile, @media (min-width: 769px) pour tablette, @media (min-width: 1024px) pour desktop."
+          ]
+        },
+        "javascript": {
+          "questions": ["javascript", "js", "dom", "event", "function", "variable", "array", "object", "promise", "async", "await", "es6", "react", "vue", "angular"],
+          "responses": [
+            "JavaScript est un langage de programmation cote client et serveur. Il manipule le DOM (Document Object Model) pour interagir avec les elements HTML. Les concepts cles incluent : variables (let, const, var), fonctions (function, arrow functions), objets, tableaux, boucles (for, while, forEach), conditions (if, switch).",
+            "ES6+ introduit des fonctionnalites modernes : const/let pour les variables, arrow functions (() => {}), template literals (``), destructuring, spread operator (...), classes, modules (import/export), promises, async/await pour la programmation asynchrone.",
+            "Les frameworks modernes : React utilise des composants, hooks (useState, useEffect), JSX. Vue.js avec la composition API, directives (v-if, v-for), reactivity. Angular avec TypeScript, services, dependency injection, routing, forms."
+          ]
+        }
+      },
+      "backend": {
+        "nodejs": {
+          "questions": ["nodejs", "node", "express", "api", "rest", "json", "middleware", "routing", "npm"],
+          "responses": [
+            "Node.js permet d'executer JavaScript cote serveur. Express.js est un framework web minimaliste pour creer des APIs REST. Les routes definissent les endpoints : app.get('/api/users', handler), app.post('/api/users', handler). Les middlewares sont des fonctions qui s'executent entre la requete et la reponse.",
+            "Une API REST utilise les methodes HTTP : GET (recuperer), POST (creer), PUT (mettre a jour), DELETE (supprimer). Les reponses sont generalement en JSON. L'authentification peut utiliser JWT (JSON Web Tokens) ou sessions."
+          ]
+        },
+        "python": {
+          "questions": ["python", "django", "flask", "fastapi", "sqlalchemy", "pandas", "numpy"],
+          "responses": [
+            "Python est populaire pour le backend. Django est un framework complet avec ORM, admin, authentification. Flask est plus leger et flexible. FastAPI est moderne avec support TypeScript natif et documentation automatique.",
+            "SQLAlchemy est un ORM Python pour interagir avec les bases de donnees. Pandas manipule les donnees tabulaires. NumPy gere les calculs numeriques et les tableaux multidimensionnels."
+          ]
+        },
+        "databases": {
+          "questions": ["base de donnees", "database", "sql", "mysql", "postgresql", "mongodb", "redis", "sqlite"],
+          "responses": [
+            "Les bases de donnees relationnelles (MySQL, PostgreSQL) utilisent SQL pour les requetes. Les concepts cles : tables, colonnes, lignes, cles primaires, cles etrangeres, index, jointures (JOIN), requetes SELECT, INSERT, UPDATE, DELETE.",
+            "MongoDB est une base NoSQL orientee documents. Redis est une base en memoire pour le cache. SQLite est une base legere integree. Les ORM (Object-Relational Mapping) simplifient l'interaction avec les bases de donnees."
+          ]
+        }
+      }
+    },
+    "developpement_mobile": {
+      "native": {
+        "android": {
+          "questions": ["android", "java", "kotlin", "studio", "sdk", "api", "activity", "fragment", "intent"],
+          "responses": [
+            "Android utilise Java ou Kotlin. Android Studio est l'IDE officiel. Le SDK Android fournit les outils et APIs. Une Activity represente un ecran, un Fragment est une partie d'Activity reutilisable. Les Intents permettent la communication entre composants.",
+            "Kotlin est maintenant le langage recommande. Les concepts cles : ViewBinding/DataBinding, RecyclerView pour les listes, Room pour la base de donnees locale, Retrofit pour les APIs, Dagger/Hilt pour l'injection de dependances."
+          ]
+        },
+        "ios": {
+          "questions": ["ios", "swift", "objective-c", "xcode", "storyboard", "viewcontroller", "uikit", "swiftui"],
+          "responses": [
+            "iOS utilise Swift (moderne) ou Objective-C (legacy). Xcode est l'IDE officiel. Storyboard permet de creer l'UI visuellement. Un ViewController gere un ecran. UIKit est le framework UI traditionnel, SwiftUI est plus moderne et declaratif.",
+            "SwiftUI utilise des Views declaratives : VStack, HStack, List, NavigationView. Les concepts : @State, @Binding, @ObservedObject pour la gestion d'etat. Core Data gere la persistance, URLSession pour le reseau."
+          ]
+        }
+      },
+      "cross_platform": {
+        "react_native": {
+          "questions": ["react native", "rn", "expo", "metro", "bridge", "native modules"],
+          "responses": [
+            "React Native permet de developper des apps iOS et Android avec JavaScript/TypeScript. Il utilise le meme code pour les deux plateformes. Expo simplifie le developpement avec des APIs pretes a l'emploi.",
+            "Le Metro bundler compile le code. Le Bridge JavaScript-Native permet la communication. Les Native Modules donnent acces aux fonctionnalites specifiques a chaque plateforme. Les composants : View, Text, Image, ScrollView, FlatList."
+          ]
+        },
+        "flutter": {
+          "questions": ["flutter", "dart", "widget", "stateful", "stateless", "provider", "bloc"],
+          "responses": [
+            "Flutter utilise Dart comme langage. Tout est un Widget : StatelessWidget (statique), StatefulWidget (dynamique). L'arbre de widgets gere l'UI. Hot Reload permet de voir les changements instantanement.",
+            "La gestion d'etat : Provider pour la simplicite, BLoC (Business Logic Component) pour la complexite, Riverpod comme alternative moderne. Les widgets cles : Container, Row, Column, ListView, GridView, AppBar, Scaffold."
+          ]
+        }
+      }
+    },
+    "hacking_ethique": {
+      "reconnaissance": {
+        "questions": ["reconnaissance", "osint", "footprinting", "scanning", "nmap", "port", "service", "banner"],
+        "responses": [
+          "La reconnaissance (Reconnaissance) est la premiere phase du hacking ethique. Elle consiste a collecter des informations sur la cible sans l'attaquer directement. L'OSINT (Open Source Intelligence) utilise des sources publiques : reseaux sociaux, moteurs de recherche, bases de donnees publiques.",
+          "Le footprinting identifie les systemes, domaines, adresses IP, ports ouverts. Nmap est l'outil principal pour le scanning de ports : nmap -sS target (scan SYN), nmap -sV target (detection de services), nmap -O target (detection d'OS). Les banners des services revelent des informations sur les versions."
+        ]
+      },
+      "vulnerabilities": {
+        "questions": ["vulnerabilite", "vulnerability", "cve", "exploit", "payload", "shellcode", "buffer overflow", "sql injection", "xss", "csrf"],
+        "responses": [
+          "Les vulnerabilites sont des failles de securite exploitables. Les CVE (Common Vulnerabilities and Exposures) cataloguent les vulnerabilites. Un exploit est un code qui exploite une vulnerabilite. Un payload est la charge utile malveillante. Le shellcode est du code machine executable.",
+          "Buffer Overflow : depassement de tampon qui peut ecraser la pile. SQL Injection : injection de code SQL malveillant via les entrees utilisateur. XSS (Cross-Site Scripting) : injection de scripts cote client. CSRF (Cross-Site Request Forgery) : execution d'actions non autorisees."
+        ]
+      },
+      "web_security": {
+        "questions": ["web security", "owasp", "top 10", "authentication", "authorization", "session", "cookie", "jwt", "https", "ssl", "tls"],
+        "responses": [
+          "L'OWASP Top 10 liste les vulnerabilites web les plus critiques : injection, broken authentication, sensitive data exposure, XML external entities, broken access control, security misconfiguration, cross-site scripting, insecure deserialization, known vulnerabilities, insufficient logging.",
+          "L'authentification verifie l'identite (login/password, 2FA, biometrics). L'autorisation controle les permissions. Les sessions maintiennent l'etat utilisateur. Les cookies stockent des donnees cote client. JWT (JSON Web Tokens) sont des tokens stateless. HTTPS/SSL/TLS chiffrent les communications."
+        ]
+      },
+      "tools": {
+        "questions": ["metasploit", "burp suite", "owasp zap", "nmap", "wireshark", "john", "hashcat", "aircrack", "kali", "parrot"],
+        "responses": [
+          "Metasploit est un framework d'exploitation avec des modules d'exploit, payloads, et post-exploitation. Burp Suite est un proxy web pour tester les applications web. OWASP ZAP est un scanner de vulnerabilites web gratuit.",
+          "Nmap scanne les ports et services. Wireshark capture et analyse le trafic reseau. John the Ripper et Hashcat cassent les mots de passe. Aircrack-ng teste la securite WiFi. Kali Linux et Parrot Security sont des distributions Linux specialisees en securite."
+        ]
+      },
+      "methodology": {
+        "questions": ["methodologie", "methodology", "pentest", "penetration testing", "phases", "reporting", "remediation"],
+        "responses": [
+          "Le pentest (penetration testing) suit des phases : 1) Reconnaissance, 2) Scanning, 3) Enumeration, 4) Vulnerabilite assessment, 5) Exploitation, 6) Post-exploitation, 7) Reporting. Chaque phase a des objectifs specifiques et des livrables.",
+          "Le reporting documente les vulnerabilites trouvees, leur criticite (Critical, High, Medium, Low), les preuves d'exploitation, et les recommandations de remediation. La remediation implique de corriger les vulnerabilites et de mettre en place des controles de securite."
+        ]
+      }
+    },
+    "general_informatique": {
+      "programming_concepts": {
+        "questions": ["programmation", "algorithm", "data structure", "complexity", "big o", "recursion", "oop", "design pattern"],
+        "responses": [
+          "La programmation implique des algorithmes (etapes pour resoudre un probleme) et des structures de donnees (tableaux, listes, arbres, graphes, hash tables). La complexite algorithmique (Big O) mesure l'efficacite : O(1) constant, O(log n) logarithmique, O(n) lineaire, O(n²) quadratique.",
+          "La recursion est une fonction qui s'appelle elle-meme. L'OOP (Object-Oriented Programming) utilise des classes, objets, encapsulation, heritage, polymorphisme. Les design patterns sont des solutions reutilisables : Singleton, Factory, Observer, MVC, MVP, MVVM."
+        ]
+      },
+      "operating_systems": {
+        "questions": ["systeme d'exploitation", "os", "linux", "windows", "macos", "kernel", "process", "thread", "memory", "file system"],
+        "responses": [
+          "Un OS gere les ressources hardware et fournit des services aux applications. Le kernel est le coeur du systeme. Les processus sont des programmes en cours d'execution. Les threads sont des unites d'execution plus legeres. La memoire est geree via la pagination et la segmentation.",
+          "Linux est open-source avec des distributions (Ubuntu, CentOS, Debian). Windows est proprietaire de Microsoft. macOS est base sur Unix. Les systemes de fichiers organisent les donnees : NTFS (Windows), ext4 (Linux), APFS (macOS)."
+        ]
+      },
+      "networking": {
+        "questions": ["reseau", "network", "tcp", "udp", "ip", "http", "https", "ftp", "ssh", "telnet", "osi", "lan", "wan"],
+        "responses": [
+          "Le modele OSI a 7 couches : Physique, Liaison, Reseau, Transport, Session, Presentation, Application. TCP est fiable avec controle de flux, UDP est rapide sans garantie. IP (Internet Protocol) route les paquets. HTTP/HTTPS sont les protocoles web.",
+          "FTP transfere des fichiers, SSH securise les connexions, Telnet est non securise. LAN (Local Area Network) couvre un site, WAN (Wide Area Network) couvre de grandes distances. Les adresses IP (IPv4/IPv6) identifient les machines sur le reseau."
+        ]
+      }
+    }
+  },
+  "fallback_messages": {
+    "gemini_unavailable": "🤖 Desole, Gemini AI n'est pas disponible actuellement. Voici une reponse basee sur ma base de connaissances :",
+    "no_match_found": "🤖 Je n'ai pas trouve d'information specifique sur ce sujet dans ma base de connaissances. Pour des questions techniques detaillees, je recommande de consulter la documentation officielle ou des ressources specialisees.",
+    "partial_match": "🤖 Voici ce que je peux vous dire sur ce sujet :"
+  },
+  "search_algorithm": {
+    "description": "L'algorithme de recherche utilise une correspondance floue basee sur les mots-cles des questions pour trouver la meilleure reponse dans la base de connaissances JSON.",
+    "threshold": 0.1,
+    "max_responses": 3
+  }
+}

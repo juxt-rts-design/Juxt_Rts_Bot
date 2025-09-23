@@ -1,0 +1,5 @@
+{
+  "botFile": "../bot_with_fallback.js",
+  "botName": "JUXT_RTS Bot",
+  "authDir": "../auth_info"
+}
