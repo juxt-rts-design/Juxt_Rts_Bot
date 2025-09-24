@@ -440,8 +440,9 @@
     <script>
         let isSessionValid = false;
         let validationTimeout = null;
-        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-        const ws = new WebSocket(`${protocol}${window.location.hostname}:${window.location.port || 3000}`);
+        // Sur Render, toujours utiliser WSS pour HTTPS
+        const protocol = 'wss://';
+        const ws = new WebSocket(`${protocol}${window.location.hostname}`);
         let currentConnectionType = null;
 
         ws.onopen = () => {
