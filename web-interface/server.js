@@ -10,19 +10,6 @@ const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whis
 
 class WebInterfaceServer {
     constructor() {
-        // Charger la configuration du bot
-        let botConfig = {};
-        try {
-            botConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'bot-config.json'), 'utf8'));
-        } catch (error) {
-            console.log('⚠️ Configuration bot non trouvée, utilisation des valeurs par défaut');
-            botConfig = {
-                botFile: '../bot_with_fallback.js',
-                botName: 'JUXT_RTS Bot',
-                authDir: '../auth_info'
-            };
-        }
-
         this.app = express();
         this.server = http.createServer(this.app);
         this.wss = new WebSocket.Server({ port: 3001 });
@@ -30,11 +17,8 @@ class WebInterfaceServer {
         this.botProcess = null;
         this.sessions = new Map();
         this.whatsappSockets = new Map();
-        this.phoneNumbers = new Map(); // Tracking des numéros de téléphone par session
         this.port = process.env.PORT || 3000;
-        this.authDir = path.resolve(botConfig.authDir || path.join(__dirname, '..', 'auth_info'));
-        this.botFile = path.resolve(botConfig.botFile || path.join(__dirname, '..', 'bot_with_fallback.js'));
-        this.botName = botConfig.botName || 'JUXT_RTS Bot';
+        this.authDir = path.join(__dirname, '..', 'auth_info');
         
         // Créer le logger Pino
         this.logger = pino({
@@ -145,21 +129,15 @@ class WebInterfaceServer {
 
             sessionDirs.forEach(sessionId => {
                 const sessionDir = path.join(this.authDir, sessionId);
-                
-                // Vérifier si la session a des fichiers d'authentification valides
-                const credsFile = path.join(sessionDir, 'creds.json');
-                const hasValidAuth = fs.existsSync(credsFile);
-                
                 const sessionInfo = {
                     type: 'existing',
-                    status: hasValidAuth ? 'disconnected' : 'invalid',
+                    status: 'disconnected',
                     createdAt: new Date(),
-                    sessionDir: sessionDir,
-                    hasValidAuth: hasValidAuth
+                    sessionDir: sessionDir
                 };
 
                 this.sessions.set(sessionId, sessionInfo);
-                console.log(`✅ Session chargée: ${sessionId} (${hasValidAuth ? 'valide' : 'invalide'})`);
+                console.log(`✅ Session chargée: ${sessionId}`);
             });
 
             console.log(`${sessionDirs.length} session(s) chargée(s) depuis auth_info`);
@@ -187,12 +165,6 @@ class WebInterfaceServer {
             case 'cancel':
                 this.cancelOperation(clientId);
                 break;
-                case 'reset_sessions':
-                    this.resetSessions(clientId);
-                    break;
-                case 'list_active_sessions':
-                    this.listActiveSessions(clientId);
-                    break;
             case 'check_session_status':
                 this.checkSessionStatus(clientId, data.sessions);
                 break;
@@ -235,55 +207,16 @@ class WebInterfaceServer {
             const sessionId = data.customSession || this.generateSessionId();
             const sessionDir = path.join(this.authDir, sessionId);
             
-            // Vérifier si une session existe déjà
-            if (this.sessions.has(sessionId)) {
-                const session = this.sessions.get(sessionId);
-                console.log(`🔍 Session trouvée: ${sessionId}, statut: ${session.status}`);
-                
-                if (session.status === 'connected') {
-                    console.log('✅ Session déjà connectée:', sessionId);
-                    this.sendToClient(clientId, {
-                        type: 'connected',
-                        message: 'Session déjà connectée'
-                    });
-                    return;
-                } else if (session.status === 'disconnected' && fs.existsSync(sessionDir)) {
-                    // Session existe mais déconnectée, essayer de se reconnecter
-                    console.log('🔄 Tentative de reconnexion pour la session:', sessionId);
-                    this.sendToClient(clientId, {
-                        type: 'status',
-                        message: 'Tentative de reconnexion...'
-                    });
-                } else {
-                    // Session existe mais pas dans le bon état, ne pas générer de QR
-                    console.log('❌ Session existe mais pas dans le bon état:', sessionId);
-                    this.sendToClient(clientId, {
-                        type: 'error',
-                        message: 'Session existe mais pas dans le bon état'
-                    });
-                    return;
-                }
-            } else {
-                // Nouvelle session - vérifier s'il y a des conflits avec des sessions actives
-                const activeSessions = Array.from(this.sessions.entries()).filter(([id, session]) => 
-                    session.status === 'connected' || session.status === 'connecting'
-                );
-                
-                if (activeSessions.length > 0) {
-                    console.log(`⚠️ ${activeSessions.length} session(s) active(s) détectée(s)`);
-                    // Permettre la création d'une nouvelle session pour un numéro différent
-                    console.log('🆕 Création d\'une nouvelle session pour un numéro différent');
-                    console.log('💡 Note: Les conflits de numéros seront détectés lors de la connexion WhatsApp');
-                }
-                
-                // Créer une nouvelle session
-                this.sessions.set(sessionId, {
-                    type: 'qrcode',
-                    status: 'pending',
-                    createdAt: new Date(),
-                    clientId: clientId,
-                    sessionDir: sessionDir
+            // Ne pas créer le dossier de session ici, seulement après connexion réussie
+
+            // Vérifier si une session existe déjà et est connectée
+            if (this.sessions.has(sessionId) && this.sessions.get(sessionId).status === 'connected') {
+                console.log('✅ Session déjà connectée:', sessionId);
+                this.sendToClient(clientId, {
+                    type: 'connected',
+                    message: 'Session déjà connectée'
                 });
+                return;
             }
 
             // Nettoyer les anciennes connexions pour cette session
@@ -349,45 +282,9 @@ class WebInterfaceServer {
 
                 if (connection === 'close') {
                     const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    const isConflict = lastDisconnect?.error?.output?.statusCode === 440 || lastDisconnect?.error?.output?.statusCode === 515; // Codes de conflit
-                    
                     console.log('❌ Connexion fermée:', lastDisconnect?.error, ', reconnexion:', shouldReconnect);
                     
-                    if (isConflict) {
-                        console.log('⚠️ Conflit de session détecté - Même numéro de téléphone utilisé');
-                        
-                        // Trouver les sessions actives
-                        const activeSessions = Array.from(this.sessions.entries()).filter(([id, session]) => 
-                            session.status === 'connected'
-                        );
-                        
-                        let conflictMessage = '❌ Conflit détecté : Ce numéro de téléphone est déjà utilisé.\n\n';
-                        conflictMessage += '📱 Sessions actives détectées :\n';
-                        activeSessions.forEach(([id, session]) => {
-                            conflictMessage += `• ${id} (${session.phoneNumber || 'Numéro inconnu'})\n`;
-                        });
-                        conflictMessage += '\n💡 Solutions :\n';
-                        conflictMessage += '1. Utilisez un numéro différent\n';
-                        conflictMessage += '2. Déconnectez une session existante\n';
-                        conflictMessage += '3. Utilisez une session existante (session_1, session_2, etc.)';
-                        
-                        this.sendToClient(clientId, {
-                            type: 'error',
-                            message: conflictMessage
-                        });
-                        
-                        // Nettoyer la session en conflit
-                        this.sessions.delete(sessionId);
-                        this.whatsappSockets.delete(sessionId);
-                        // Nettoyer le tracking du numéro de téléphone
-                        for (const [phone, sid] of this.phoneNumbers.entries()) {
-                            if (sid === sessionId) {
-                                this.phoneNumbers.delete(phone);
-                                console.log(`🧹 Numéro de téléphone supprimé du tracking: ${phone}`);
-                                break;
-                            }
-                        }
-                    } else if (shouldReconnect) {
+                    if (shouldReconnect) {
                         console.log('🔄 Tentative de reconnexion...');
                         this.sendToClient(clientId, {
                             type: 'status',
@@ -546,12 +443,6 @@ class WebInterfaceServer {
             session.status = 'connected';
             session.connectedAt = new Date();
             
-            // Tracker le numéro de téléphone si disponible
-            if (session.phoneNumber) {
-                this.phoneNumbers.set(session.phoneNumber, sessionId);
-                console.log(`📱 Numéro de téléphone tracké: ${session.phoneNumber} → ${sessionId}`);
-            }
-            
             this.sendToClient(session.clientId, {
                 type: 'connected'
             });
@@ -564,10 +455,6 @@ class WebInterfaceServer {
             });
 
             console.log(`✅ Session ${sessionId} connectée à WhatsApp`);
-            
-            // Démarrer automatiquement le bot après connexion
-            console.log(`🚀 Démarrage automatique du bot pour la session ${sessionId}`);
-            this.startBot();
         }
     }
 
@@ -576,7 +463,7 @@ class WebInterfaceServer {
         if (this.botProcess) {
             console.log('Bot déjà en cours d\'exécution');
             this.broadcast({
-                type: 'bot_started',
+                type: 'error',
                 message: 'Bot déjà en cours d\'exécution'
             });
             return;
@@ -598,12 +485,9 @@ class WebInterfaceServer {
         const [sessionId, session] = connectedSession;
         console.log(`Démarrage du bot avec la session: ${sessionId}`);
         
-        // Démarrer le bot avec le fichier configuré
-        const botFileName = path.basename(this.botFile);
-        const botDir = path.dirname(this.botFile);
-        
-        this.botProcess = spawn('node', [botFileName], {
-            cwd: botDir,
+        // Démarrer le bot avec le fichier principal
+        this.botProcess = spawn('node', ['bot_with_fallback.js'], {
+            cwd: path.join(__dirname, '..'),
             stdio: ['pipe', 'pipe', 'pipe'],
             env: {
                 ...process.env,
@@ -666,51 +550,6 @@ class WebInterfaceServer {
         });
     }
 
-    resetSessions(clientId) {
-        console.log('Reset des sessions demandé par le client');
-        
-        // Arrêter le bot s'il est en cours d'exécution
-        if (this.botProcess) {
-            this.stopBot();
-        }
-        
-        // Nettoyer les sessions en mémoire
-        this.sessions.clear();
-        this.whatsappSockets.clear();
-        
-        // Recharger les sessions existantes
-        this.loadExistingSessions();
-        
-        this.sendToClient(clientId, {
-            type: 'sessions_reset',
-            message: 'Sessions réinitialisées'
-        });
-        
-        console.log('Sessions réinitialisées');
-    }
-
-    listActiveSessions(clientId) {
-        console.log('Liste des sessions actives demandée');
-        
-        const activeSessions = Array.from(this.sessions.entries()).filter(([id, session]) => 
-            session.status === 'connected'
-        );
-        
-        const sessionList = activeSessions.map(([id, session]) => ({
-            id: id,
-            phoneNumber: session.phoneNumber || 'Numéro inconnu',
-            connectedAt: session.connectedAt || 'Inconnu'
-        }));
-        
-        this.sendToClient(clientId, {
-            type: 'active_sessions_list',
-            sessions: sessionList,
-            count: sessionList.length
-        });
-        
-        console.log(`${sessionList.length} session(s) active(s) trouvée(s)`);
-    }
-
     checkSessionStatus(clientId, sessions) {
         console.log('Vérification du statut des sessions:', sessions);
         
@@ -734,34 +573,15 @@ class WebInterfaceServer {
             });
         } else {
             console.log('Aucune session connectée trouvée');
-            // Vérifier si des sessions existent mais sont déconnectées
-            const existingSessions = Array.from(this.sessions.entries()).filter(([id, session]) => 
-                sessions.includes(id) && session.status === 'disconnected'
-            );
-            
-            if (existingSessions.length > 0) {
-                console.log('Sessions existantes mais déconnectées trouvées');
-                this.sendToClient(clientId, {
-                    type: 'no_connected_sessions',
-                    message: 'Sessions existantes mais déconnectées'
-                });
-            } else {
-                this.sendToClient(clientId, {
-                    type: 'no_connected_sessions',
-                    message: 'Aucune session connectée'
-                });
-            }
         }
     }
 
     checkSpecificSession(clientId, sessionId) {
         console.log('Vérification de la session spécifique:', sessionId);
         
-        // Vérifier si cette session spécifique existe
+        // Vérifier si cette session spécifique est connectée
         if (this.sessions.has(sessionId)) {
             const session = this.sessions.get(sessionId);
-            console.log(`Session spécifique trouvée: ${sessionId}, statut: ${session.status}`);
-            
             if (session.status === 'connected') {
                 console.log(`Session spécifique connectée: ${sessionId}`);
                 
@@ -776,34 +596,9 @@ class WebInterfaceServer {
                 });
             } else {
                 console.log(`Session spécifique trouvée mais non connectée: ${sessionId}`);
-                // Envoyer un message pour indiquer que la session existe mais n'est pas connectée
-                this.sendToClient(clientId, {
-                    type: 'session_validation',
-                    session: sessionId,
-                    valid: true,
-                    reason: 'Session trouvée mais non connectée'
-                });
             }
         } else {
             console.log(`Session spécifique non trouvée: ${sessionId}`);
-            // Vérifier si le dossier de session existe dans auth_info
-            const sessionDir = path.join(this.authDir, sessionId);
-            if (fs.existsSync(sessionDir)) {
-                console.log(`Dossier de session trouvé: ${sessionId}`);
-                this.sendToClient(clientId, {
-                    type: 'session_validation',
-                    session: sessionId,
-                    valid: true,
-                    reason: 'Session trouvée dans auth_info'
-                });
-            } else {
-                this.sendToClient(clientId, {
-                    type: 'session_validation',
-                    session: sessionId,
-                    valid: false,
-                    reason: 'Session non trouvée'
-                });
-            }
         }
     }
 
