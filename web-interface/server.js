@@ -12,7 +12,7 @@ class WebInterfaceServer {
     constructor() {
         this.app = express();
         this.server = http.createServer(this.app);
-        this.wss = new WebSocket.Server({ port: 3001 });
+        this.wss = new WebSocket.Server({ server: this.server });
         this.clients = new Map();
         this.botProcess = null;
         this.sessions = new Map();
