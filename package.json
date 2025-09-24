@@ -4,9 +4,9 @@
   "description": "Bot WhatsApp intelligent avec système de fallback JSON pour les réponses informatiques",
   "main": "server_with_fallback.js",
   "scripts": {
-    "start": "node bot_with_fallback.js",
-    "server": "node server_with_fallback.js",
+    "start": "node start-render.js",
     "bot": "node bot_with_fallback.js",
+    "server": "node server_with_fallback.js",
     "dev": "nodemon server_with_fallback.js",
     "test": "node test_fallback.js",
     "install-deps": "npm install",

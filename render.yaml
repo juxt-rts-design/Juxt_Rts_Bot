@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: juxt-rts-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CREATOR_CONTACT
+        value: +241065255707@s.whatsapp.net
+      - key: SESSION_DIR
+        value: ./auth_info
+    disk:
+      name: auth_info
+      mountPath: /opt/render/project/src/auth_info
+      sizeGB: 1
