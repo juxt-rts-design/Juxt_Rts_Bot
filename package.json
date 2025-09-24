@@ -2,7 +2,7 @@
   "name": "juxt-rts-bot-fallback",
   "version": "2.0.0",
   "description": "Bot WhatsApp intelligent avec système de fallback JSON pour les réponses informatiques",
-  "main": "server_with_fallback.js",
+  "main": "start-render.js",
   "scripts": {
     "start": "node start-render.js",
     "bot": "node bot_with_fallback.js",
