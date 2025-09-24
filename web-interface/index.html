@@ -441,7 +441,7 @@
         let isSessionValid = false;
         let validationTimeout = null;
         const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-        const ws = new WebSocket(`${protocol}${window.location.hostname}:3001`);
+        const ws = new WebSocket(`${protocol}${window.location.hostname}:${window.location.port || 3000}`);
         let currentConnectionType = null;
 
         ws.onopen = () => {
