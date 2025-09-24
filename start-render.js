@@ -9,16 +9,15 @@ const WebInterfaceServer = require('./web-interface/server.js');
 
 console.log('🚀 Démarrage du bot sur Render...');
 
-// Créer et démarrer le serveur web
+// Créer le serveur web (il démarre automatiquement dans le constructeur)
 const server = new WebInterfaceServer();
 
-// Démarrer le serveur sur le port Render
-const PORT = process.env.PORT || 3000;
-server.server.listen(PORT, () => {
-  console.log('✅ Bot démarré sur Render !');
-  console.log(`🌐 Interface web disponible sur le port ${PORT}`);
-  console.log(`📱 Accédez à: https://juxt-rts-bot.onrender.com`);
-});
+// Le serveur démarre automatiquement dans le constructeur
+// Pas besoin de redémarrer ici
+
+console.log('✅ Bot démarré sur Render !');
+console.log(`🌐 Interface web disponible sur le port ${process.env.PORT || 3000}`);
+console.log(`📱 Accédez à: https://juxt-rts-bot.onrender.com`);
 
 // Gérer l'arrêt propre
 process.on('SIGINT', () => {
