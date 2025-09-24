@@ -66,6 +66,20 @@ class WebInterfaceServer {
             this.stopBot();
             res.json({ success: true, message: 'Bot arrêté' });
         });
+
+        // Route de santé pour empêcher le bot de s'endormir sur Render
+        this.app.get('/health', (req, res) => {
+            const activeSessions = Array.from(this.sessions.values()).filter(s => s.status === 'connected').length;
+            const botRunning = this.botProcess && !this.botProcess.killed;
+            
+            res.json({
+                status: 'healthy',
+                timestamp: new Date().toISOString(),
+                activeSessions: activeSessions,
+                botRunning: botRunning,
+                uptime: process.uptime()
+            });
+        });
     }
 
     setupWebSocket() {
@@ -281,19 +295,39 @@ class WebInterfaceServer {
                 }
 
                 if (connection === 'close') {
-                    const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    console.log('❌ Connexion fermée:', lastDisconnect?.error, ', reconnexion:', shouldReconnect);
+                    const error = lastDisconnect?.error;
+                    const statusCode = error?.output?.statusCode;
+                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                     
-                    if (shouldReconnect) {
+                    console.log('❌ Connexion fermée:', error, ', reconnexion:', shouldReconnect);
+                    
+                    // Vérifier si c'est une erreur de session corrompue (Bad MAC)
+                    const isSessionCorrupted = error?.message?.includes('Bad MAC') || 
+                                             error?.message?.includes('session') ||
+                                             statusCode === 515;
+                    
+                    if (isSessionCorrupted) {
+                        console.log('🚨 Session corrompue détectée, suppression et nettoyage...');
+                        this.sendToClient(clientId, {
+                            type: 'error',
+                            message: 'Session corrompue détectée. Veuillez vous reconnecter.'
+                        });
+                        
+                        // Nettoyer la session corrompue
+                        this.cleanupCorruptedSession(sessionId);
+                        return;
+                    }
+                    
+                    if (shouldReconnect && !isSessionCorrupted) {
                         console.log('🔄 Tentative de reconnexion...');
                         this.sendToClient(clientId, {
                             type: 'status',
                             message: 'Reconnexion en cours...'
                         });
-                        // Reconnexion automatique après 3 secondes
+                        // Reconnexion automatique après 5 secondes (augmenté pour éviter les boucles)
                         setTimeout(() => {
                             this.generateQRCode(clientId, { customSession: sessionId });
-                        }, 3000);
+                        }, 5000);
                     } else {
                         console.log('🗑️ Suppression de la session:', sessionId);
                         this.sessions.delete(sessionId);
@@ -361,10 +395,24 @@ class WebInterfaceServer {
                 const { connection, lastDisconnect } = update;
                 
                 if (connection === 'close') {
-                    const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    console.log('Connexion fermée:', lastDisconnect?.error, ', reconnexion:', shouldReconnect);
+                    const error = lastDisconnect?.error;
+                    const statusCode = error?.output?.statusCode;
+                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                     
-                    if (shouldReconnect) {
+                    console.log('Connexion fermée:', error, ', reconnexion:', shouldReconnect);
+                    
+                    // Vérifier si c'est une erreur de session corrompue (Bad MAC)
+                    const isSessionCorrupted = error?.message?.includes('Bad MAC') || 
+                                             error?.message?.includes('session') ||
+                                             statusCode === 515;
+                    
+                    if (isSessionCorrupted) {
+                        console.log('🚨 Session corrompue détectée (pairing), suppression et nettoyage...');
+                        this.cleanupCorruptedSession(sessionId);
+                        return;
+                    }
+                    
+                    if (shouldReconnect && !isSessionCorrupted) {
                         this.generatePairingCode(clientId, data);
                     } else {
                         this.sessions.delete(sessionId);
@@ -614,6 +662,35 @@ class WebInterfaceServer {
         
         const nextNumber = sessionNumbers.length > 0 ? Math.max(...sessionNumbers) + 1 : 1;
         return `session_${nextNumber}`;
+    }
+
+    // Méthode pour nettoyer les sessions corrompues
+    cleanupCorruptedSession(sessionId) {
+        try {
+            console.log(`🧹 Nettoyage de la session corrompue: ${sessionId}`);
+            
+            // Supprimer de la mémoire
+            this.sessions.delete(sessionId);
+            this.whatsappSockets.delete(sessionId);
+            this.phoneNumbers.delete(sessionId);
+            
+            // Supprimer le dossier de session du disque
+            const sessionDir = path.join(this.authDir, sessionId);
+            if (fs.existsSync(sessionDir)) {
+                fs.rmSync(sessionDir, { recursive: true, force: true });
+                console.log(`🗑️ Dossier de session supprimé: ${sessionDir}`);
+            }
+            
+            // Arrêter le bot s'il était en cours d'exécution
+            if (this.botProcess) {
+                this.stopBot();
+            }
+            
+            console.log(`✅ Session corrompue nettoyée: ${sessionId}`);
+            
+        } catch (error) {
+            console.error(`❌ Erreur lors du nettoyage de la session ${sessionId}:`, error);
+        }
     }
 
     sendToClient(clientId, message) {

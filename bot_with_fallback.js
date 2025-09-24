@@ -2693,11 +2693,29 @@ async function startBot() {
         }
         
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connexion fermée, reconnexion:', shouldReconnect);
+            const error = lastDisconnect?.error;
+            const statusCode = error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            if (shouldReconnect) {
-                startBot();
+            console.log('Connexion fermée, reconnexion:', shouldReconnect);
+            console.log('Détails erreur:', error?.message, 'Code:', statusCode);
+            
+            // Vérifier si c'est une erreur de session corrompue
+            const isSessionCorrupted = error?.message?.includes('Bad MAC') || 
+                                     error?.message?.includes('session') ||
+                                     statusCode === 515;
+            
+            if (isSessionCorrupted) {
+                console.log('🚨 Session corrompue détectée dans le bot principal');
+                console.log('🛑 Arrêt du bot pour éviter les boucles infinies');
+                return; // Ne pas essayer de se reconnecter
+            }
+            
+            if (shouldReconnect && !isSessionCorrupted) {
+                console.log('🔄 Tentative de reconnexion dans 5 secondes...');
+                setTimeout(() => {
+                    startBot();
+                }, 5000);
             }
         } else if (connection === 'open') {
             console.log('✅ Connecté à WhatsApp !');
