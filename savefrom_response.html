@@ -1,0 +1,48 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta content="width=device-width, initial-scale=1.0, maximum-scale=5.0, shrink-to-fit=no" name="viewport">
+  <meta name="robots" content="noindex, nofollow">
+  <title>SaveFrom.net</title>
+</head>
+<body>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-9ZMEKK0DW7"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-9ZMEKK0DW7');
+  </script>
+
+    <script src="/build/js/runtime.js?h=c6c2c9af.js"></script><script src="/build/js/vendor.js?h=c5ad76ef.js"></script><script src="/build/js/workerApi.js?h=6a14a04d.js"></script>    <script>
+      (function(){
+        var host = 'worker.savefrom.net';
+        var postData = {"sf_url":"https:\/\/www.facebook.com\/share\/r\/1aUKgjqC4V\/?mibextid=wwXIfr","new":"2","lang":"fr","app":"","sf-nomad":"1"};
+        gtag('event', 'request', {
+          event_category: 'worker',
+          event_label: ''
+        });
+        const account = null;
+        workerApi('https://' + host + '/savefrom.php', postData, account,
+          function(response){
+            gtag('event', 'success', {
+              event_category: 'worker',
+              event_label: [response.status, response.statusText].join(' ')
+            });
+          },
+          function(error){
+            console.error('worker error', error);
+            gtag('event', 'worker-error', {
+              event_category: 'worker',
+              event_label: ['error', error.code || error.name].join(' ')
+            });
+          }
+        );
+      })();
+    </script>
+
+</body>
+</html>
+

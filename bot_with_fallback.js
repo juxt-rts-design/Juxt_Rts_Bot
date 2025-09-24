@@ -464,11 +464,12 @@ async function processCriticalCommand(sock, msg, command, fullCommand, jid, isGr
                 
             case 'creator':
                 await sock.sendMessage(jid, {
-                    text: `👨‍💻 *CRÉATEUR DE JUXT_RTS BOT*\n\n` +
-                          `*Nom:* ELLA ASSOUMOU Juste Renaric\n` +
-                          `*WhatsApp:* +241076234942\n` +
-                          `*Spécialité:* Développement Web, Mobile & Hacking Éthique\n\n` +
-                          `*Contactez-moi pour des projets ou des questions techniques !*`
+                    image: { url: './images/creator.jpg' },
+                    caption: `👨‍💻 *CRÉATEUR DE JUXT_RTS BOT*\n\n` +
+                            `*Nom:* ELLA ASSOUMOU Juste Renaric\n` +
+                            `*WhatsApp:* +241076234942\n` +
+                            `*Spécialité:* Développement Web, Mobile & Hacking Éthique\n\n` +
+                            `*Contactez-moi pour des projets ou des questions techniques !*`
                 });
                 break;
                 
@@ -1955,6 +1956,110 @@ async function processStickerCommand(sock, jid, quotedMsg) {
 }
 
 /**
+ * Traite la conversion de sticker animé en vidéo
+ */
+async function processStickerToVideo(sock, jid, quotedMsg) {
+    try {
+        console.log('🎬 Début conversion sticker → vidéo...');
+        
+        await sock.sendMessage(jid, {
+            text: '🎬 Je convertis ton sticker animé en vidéo... ⏳'
+        });
+
+        // Télécharger le sticker
+        const stream = await downloadContentFromMessage(quotedMsg.stickerMessage, 'sticker');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+        const stickerBuffer = buffer;
+
+        // Vérifier si c'est un sticker animé (WebP animé)
+        const isAnimated = await checkIfAnimatedWebP(stickerBuffer);
+        
+        if (!isAnimated) {
+            await sock.sendMessage(jid, {
+                text: '❌ *Ce sticker n\'est pas animé !*\n\n' +
+                      '💡 *Astuce :* Seuls les stickers animés peuvent être convertis en vidéo.\n' +
+                      '🎨 *Pour un sticker normal :* Utilise `-image` pour le convertir en image.'
+            });
+            return;
+        }
+
+        // Créer un nom de fichier unique
+        const timestamp = Date.now();
+        const tempStickerPath = path.join(__dirname, `temp_sticker_${timestamp}.webp`);
+        const outputVideoPath = path.join(__dirname, `temp_video_${timestamp}.mp4`);
+
+        try {
+            // Sauvegarder le sticker temporairement
+            fs.writeFileSync(tempStickerPath, stickerBuffer);
+
+            // Convertir WebP animé en MP4 avec ffmpeg
+            console.log('🔄 Conversion WebP → MP4...');
+            const ffmpegCommand = `ffmpeg -i "${tempStickerPath}" -vf "scale=512:512" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -r 10 "${outputVideoPath}"`;
+            
+            await execAsync(ffmpegCommand);
+            
+            // Vérifier que la vidéo a été créée
+            if (!fs.existsSync(outputVideoPath)) {
+                throw new Error('La conversion a échoué');
+            }
+
+            // Envoyer la vidéo
+            const videoBuffer = fs.readFileSync(outputVideoPath);
+            await sock.sendMessage(jid, {
+                video: videoBuffer,
+                caption: '🎬 *Sticker animé converti en vidéo !*\n\n✨ *Conversion réussie !*'
+            });
+
+            console.log('✅ Conversion sticker → vidéo réussie');
+
+        } finally {
+            // Nettoyer les fichiers temporaires
+            try {
+                if (fs.existsSync(tempStickerPath)) fs.unlinkSync(tempStickerPath);
+                if (fs.existsSync(outputVideoPath)) fs.unlinkSync(outputVideoPath);
+            } catch (cleanupError) {
+                console.log('⚠️ Erreur nettoyage:', cleanupError.message);
+            }
+        }
+
+    } catch (error) {
+        console.error('❌ Erreur processStickerToVideo:', error.message);
+        await sock.sendMessage(jid, {
+            text: '😅 *Erreur lors de la conversion !*\n\n' +
+                  '💡 *Vérifications :*\n' +
+                  '• Le sticker est-il vraiment animé ?\n' +
+                  '• FFmpeg est-il installé ?\n' +
+                  '• Réessaie avec un autre sticker animé !'
+        });
+    }
+}
+
+/**
+ * Vérifie si un WebP est animé
+ */
+async function checkIfAnimatedWebP(buffer) {
+    try {
+        // Vérifier la signature WebP
+        if (buffer.length < 12) return false;
+        
+        const signature = buffer.toString('hex', 0, 4);
+        if (signature !== '52494646') return false; // "RIFF"
+        
+        const webpSignature = buffer.toString('hex', 8, 12);
+        if (webpSignature !== '57454250') return false; // "WEBP"
+        
+        // Chercher le chunk ANIM dans le WebP
+        const bufferString = buffer.toString('hex');
+        return bufferString.includes('414e494d'); // "ANIM"
+        
+    } catch (error) {
+        console.error('❌ Erreur vérification WebP animé:', error.message);
+        return false;
+    }
+}
+
+/**
  * Traite la commande image
  */
 async function processImageCommand(sock, jid, quotedMsg) {
@@ -2188,72 +2293,85 @@ function generateContextualResponse(userId, message) {
  * Affiche le menu des commandes disponibles
  */
 async function showMenu(sock, jid) {
-    const menuText = `🤖 *MENU JUXT_RTS BOT* 🤖
+    const menuText = `╔══════════════════════════════════════╗
+║        🤖 *JUXT_RTS BOT* 🤖        ║
+║     *Menu Interactif & Dynamique*     ║
+╚══════════════════════════════════════╝
 
-📋 *COMMANDES DISPONIBLES :*
+┌─ 🎨 *MÉDIAS & CRÉATION* ─┐
+│ • \`sticker\` → Convertir en sticker 🎭
+│ • \`image\` → Sticker vers image 📸
+│ • \`video\` → Sticker animé → vidéo 🎬
+│ • \`send\` → Sauvegarder vue unique 💾
+│ • \`img\` → Recherche inversée 🔍
+│ • \`transcrire\` → Audio → texte 🎵
+└─────────────────────────────┘
 
-🎨 *MÉDIAS :*
-• \`sticker\` - Convertir image/vidéo en sticker
-• \`image\` - Convertir sticker en image  
-• \`video\` - Convertir sticker en vidéo
-• \`send\` - Sauvegarder vue unique en photo
-• \`img\` - Recherche inversée d'image
-• \`transcrire\` - Transcription audio
+┌─ 🌐 *TÉLÉCHARGEMENT* ─┐
+│ • *YouTube* → Téléchargement optimisé 📺
+│ • *Facebook* → API avancée ✅
+│ • *TikTok* → Via tikwm.com ✅
+│ • *Instagram* → API + scraping ✅
+│ • *Pinterest* → Multi-méthodes ✅
+│ • ⏱️ Limite : 10 min max
+└─────────────────────────┘
 
-🎬 *TÉLÉCHARGEMENT :*
-• *YouTube* : Téléchargement complet avec optimisations
-• *Facebook* : Téléchargement via API ✅
-• *TikTok* : Téléchargement via tikwm.com ✅
-• *Instagram* : Téléchargement via API ✅
-• *Pinterest* : Téléchargement via API + scraping ✅
-• Limite : 10 minutes maximum pour WhatsApp
+┌─ 🔍 *RECHERCHE & IA* ─┐
+│ • \`find [terme]\` → Google web 🌐
+│ • \`gimage [terme]\` → Images Google 🖼️
+│ • \`img\` → Recherche inversée 🔄
+│ • 💬 Chat IA → Questions libres 🤖
+│ • 🎵 Audio IA → Réponses vocales 🗣️
+└─────────────────────────┘
 
-🔍 *RECHERCHE :*
-• \`find [terme]\` - Recherche web Google
-• \`gimage [terme]\` - Recherche d'images Google
-• \`img\` - Recherche inversée d'image (répondre à une image)
+┌─ 🎉 *DIVERTISSEMENT* ─┐
+│ • \`joke\` → Blagues gabonaises 😄
+│ • \`quote\` → Citations inspirantes 💭
+│ • \`fact\` → Faits scientifiques 🧪
+│ • \`steve\` → Citations Steve Jobs 🍎
+│ • \`meditation\` → Citations zen 🧘
+│ • \`time\` → Heure Gabon 🇬🇦
+└─────────────────────────┘
 
-🎵 *AUDIO :*
-• Envoie une note vocale pour transcription automatique
-• \`transcrire\` - Transcription manuelle
+┌─ 📊 *UTILITAIRES* ─┐
+│ • \`stats\` → Statistiques 📈
+│ • \`poll [question]\` → Sondage 📊
+│ • \`weather [ville]\` → Météo 🌤️
+│ • \`backup\` → Sauvegarde 💾
+└─────────────────────┘
 
-💬 *CHAT IA :*
-• Pose-moi n'importe quelle question !
-• Je réponds sur l'informatique, développement web/mobile, hacking éthique
-• Réponses en français avec ton amical et professionnel
+┌─ 🛡️ *MODÉRATION* ─┐
+│ • \`kick @user\` → Expulser 👢
+│ • \`ban @user\` → Bannir 🚫
+│ • \`activity\` → Analyse groupe 📊
+│ • \`wordcloud\` → Nuage de mots ☁️
+│ • \`results\` → Résultats sondages 📋
+└─────────────────────┘
 
-🎉 *DIVERTISSEMENT :*
-• \`joke\` - Blagues gabonaises rigolotes
-• \`quote\` - Citations inspirantes
-• \`fact\` - Faits scientifiques intéressants
-• \`steve\` - Citations de Steve Jobs
-• \`meditation\` - Citations à méditer
-• \`time\` - Heure actuelle (Gabon)
+┌─ 🔧 *ADMINISTRATION* ─┐
+│ • \`restart\` → Redémarrer 🔄
+│ • \`status\` → État système 📊
+│ • \`logs\` → Voir logs 📋
+└─────────────────────────┘
 
-📊 *UTILITAIRES :*
-• \`stats\` - Statistiques du groupe/chat
-• \`poll [question]\` - Créer un sondage
-• \`weather [ville]\` - Météo en temps réel ✅
-• \`backup\` - Sauvegarde des données ✅
+┌─ 📞 *CONTACT & SUPPORT* ─┐
+│ • \`creator\` → Infos créateur 👨‍💻
+│ • \`support\` → Support technique 🆘
+└─────────────────────────────┘
 
-🛡️ *MODÉRATION :*
-• \`kick @user\` - Expulser un membre ✅
-• \`ban @user [raison]\` - Bannir un membre ✅
-• \`activity\` - Analyse d'activité du groupe ✅
-• \`wordcloud\` - Nuage de mots du groupe ✅
-• \`results\` - Résultats des sondages ✅
+╔══════════════════════════════════════╗
+║  💡 *ASTUCE* : Tape \`-menu\` à tout  ║
+║     moment pour revoir ce menu !     ║
+╚══════════════════════════════════════╝
 
-📚 *BASE DE CONNAISSANCES :*
-• Développement Web (HTML, CSS, JS, React, etc.)
-• Développement Mobile (React Native, Flutter, etc.)
-• Hacking Éthique (sécurité, pentest, etc.)
+🚀 *Propulsé par Gemini AI + Fallback JSON*
+⚡ *Interface Web disponible sur le port 3001*`;
 
-💡 *ASTUCE :* Réponds à un média avec une commande pour l'utiliser !
-
-🤗 *Besoin d'aide ?* Tape \`-menu\` à tout moment !`;
-
+    // Envoyer la vidéo avec le menu en caption (reconnectés)
     await sock.sendMessage(jid, {
-        text: menuText
+        video: { url: './videos/menu.mp4' },
+        caption: menuText,
+        gifPlayback: true
     });
 }
 
@@ -2815,17 +2933,37 @@ sock.ev.on('messages.upsert', async (m) => {
                 command: command,
                 hasImageMessage: !!quotedMsg.imageMessage,
                 hasVideoMessage: !!quotedMsg.videoMessage,
+                hasStickerMessage: !!quotedMsg.stickerMessage,
                 hasViewOnceMessage: !!quotedMsg.viewOnceMessage,
                 viewOnceImage: !!quotedMsg.viewOnceMessage?.imageMessage,
                 viewOnceVideo: !!quotedMsg.viewOnceMessage?.videoMessage
             });
             
-            // Réponse à une image/vidéo (normale ou vue unique)
-            if (quotedMsg.imageMessage || quotedMsg.videoMessage || 
+            // Réponse à une image/vidéo/sticker (normale ou vue unique)
+            if (quotedMsg.imageMessage || quotedMsg.videoMessage || quotedMsg.stickerMessage ||
                 quotedMsg.viewOnceMessage?.imageMessage || quotedMsg.viewOnceMessage?.videoMessage ||
                 quotedMsg.viewOnceMessageV2?.imageMessage || quotedMsg.viewOnceMessageV2?.videoMessage) {
                 if (command === 'sticker' || command === '-sticker') {
-                    await processStickerCommand(sock, jid, quotedMsg);
+                    // Vérifier si c'est un sticker pour la conversion en vidéo
+                    if (quotedMsg.stickerMessage) {
+                        await processStickerToVideo(sock, jid, quotedMsg);
+                    } else {
+                        // Image/vidéo vers sticker
+                        await processStickerCommand(sock, jid, quotedMsg);
+                    }
+                    return;
+                } else if (command === 'video' || command === '-video') {
+                    // Convertir sticker animé en vidéo
+                    if (quotedMsg.stickerMessage) {
+                        await processStickerToVideo(sock, jid, quotedMsg);
+                    } else {
+                        await sock.sendMessage(jid, {
+                            text: '🎬 *Convertir sticker en vidéo :*\n\n' +
+                                  '1. Envoie un sticker animé\n' +
+                                  '2. Réponds avec `-video`\n\n' +
+                                  'Je vais le convertir ! 😊'
+                        });
+                    }
                     return;
                 } else if (command === 'send' || command === '-send') {
                     console.log('📸 Commande send détectée sur image/vidéo normale');
@@ -3027,12 +3165,18 @@ sock.ev.on('messages.upsert', async (m) => {
                     break;
                     
                 case 'creator':
-                    await sock.sendMessage(jid, {
-                        text: `👨‍💻 *CRÉATEUR DE JUXT_RTS BOT*\n\n` +
-                              `*Nom:* ELLA ASSOUMOU Juste Renaric\n` +
-                              `*WhatsApp:* +241076234942\n` +
-                              `*Spécialité:* Développement Web, Mobile & Hacking Éthique\n\n` +
-                              `*Contactez-moi pour des projets ou des questions techniques !*`
+                    // Réagir au message
+                    await reactToMessage(sock, sender, msg.key.id, 'ℹ️');
+                    // Envoi de l'image et du texte
+                    await sock.sendMessage(sender, {
+                        image: { url: './images/creator.jpg' },
+                        caption: `🌟 **Juxt_Rts Bot - À propos** 🌟
+
+**Description** : Je suis Juxt_Rts Bot, un assistant WhatsApp intelligent et polyvalent créé pour aider, divertir et gérer vos groupes avec style ! 😎
+
+**Créateur** : ELLA ASSOUMOU Juste Renaric
+**Numéro WhatsApp du créateur** : +${CREATOR_CONTACT.split('@')[0]}
+**Site web** : https://x.ai/grok`
                     });
                     break;
                     
