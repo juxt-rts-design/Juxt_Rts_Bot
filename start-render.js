@@ -5,42 +5,30 @@
  * Gère l'interface web et le bot WhatsApp
  */
 
-const { spawn } = require('child_process');
-const path = require('path');
+const WebInterfaceServer = require('./web-interface/server.js');
 
 console.log('🚀 Démarrage du bot sur Render...');
 
-// Démarrer l'interface web
-console.log('🌐 Démarrage de l\'interface web...');
-const webProcess = spawn('node', ['web-interface/server.js'], {
-  cwd: __dirname,
-  stdio: 'inherit',
-  env: {
-    ...process.env,
-    PORT: process.env.PORT || 3000
-  }
-});
+// Créer et démarrer le serveur web
+const server = new WebInterfaceServer();
 
-webProcess.on('error', (err) => {
-  console.error('❌ Erreur interface web:', err);
-});
-
-webProcess.on('exit', (code) => {
-  console.log(`🌐 Interface web arrêtée avec le code: ${code}`);
+// Démarrer le serveur sur le port Render
+const PORT = process.env.PORT || 3000;
+server.server.listen(PORT, () => {
+  console.log('✅ Bot démarré sur Render !');
+  console.log(`🌐 Interface web disponible sur le port ${PORT}`);
+  console.log(`📱 Accédez à: https://juxt-rts-bot.onrender.com`);
 });
 
 // Gérer l'arrêt propre
 process.on('SIGINT', () => {
   console.log('🛑 Arrêt du bot...');
-  webProcess.kill('SIGINT');
+  server.stopBot();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   console.log('🛑 Arrêt du bot...');
-  webProcess.kill('SIGTERM');
+  server.stopBot();
   process.exit(0);
 });
-
-console.log('✅ Bot démarré sur Render !');
-console.log(`🌐 Interface web disponible sur le port ${process.env.PORT || 3000}`);
