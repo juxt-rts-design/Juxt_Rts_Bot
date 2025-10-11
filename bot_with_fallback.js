@@ -2700,10 +2700,10 @@ async function startBot() {
             console.log('Connexion fermée, reconnexion:', shouldReconnect);
             console.log('Détails erreur:', error?.message, 'Code:', statusCode);
             
-            // Vérifier si c'est une erreur de session corrompue
-            const isSessionCorrupted = error?.message?.includes('Bad MAC') || 
-                                     error?.message?.includes('session') ||
-                                     statusCode === 515;
+            // Vérifier si c'est une erreur de session corrompue (mais pas lors de la première connexion)
+            const isSessionCorrupted = (error?.message?.includes('Bad MAC') || 
+                                      error?.message?.includes('session')) &&
+                                     statusCode !== 515; // Code 515 peut être normal lors de la première connexion
             
             if (isSessionCorrupted) {
                 console.log('🚨 Session corrompue détectée dans le bot principal');
@@ -2711,7 +2711,7 @@ async function startBot() {
                 return; // Ne pas essayer de se reconnecter
             }
             
-            if (shouldReconnect && !isSessionCorrupted) {
+            if (shouldReconnect) {
                 console.log('🔄 Tentative de reconnexion dans 5 secondes...');
                 setTimeout(() => {
                     startBot();
