@@ -1,4 +1,4 @@
-# 🤖 Juxt_Rts Bot - Système de Fallback JSON
+﻿# 🤖 Juxt_Rts Bot - Système de Fallback JSON
 
 ## Vue d'ensemble
 
@@ -45,7 +45,7 @@ Bot_1/
 ├── fallbackHandler.js           # Gestionnaire de fallback
 ├── bot_with_fallback.js         # Bot principal avec fallback
 ├── server_with_fallback.js      # Serveur Express avec API
-├── test_fallback.js             # Script de test
+├── package.json                 # Scripts npm (dont test)
 ├── env.example                  # Variables d'environnement
 └── README_FALLBACK.md           # Cette documentation
 ```
@@ -103,7 +103,7 @@ npm run dev
 npm test
 
 # Test manuel
-node test_fallback.js
+# Aucun script manuel séparé actuellement
 ```
 
 ## 🔧 API du serveur

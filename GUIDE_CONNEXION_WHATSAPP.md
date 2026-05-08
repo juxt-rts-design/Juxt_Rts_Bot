@@ -38,13 +38,7 @@ PORT=3000
 
 #### 3. **Démarrage du bot**
 ```bash
-# Windows
-start_bot.bat
-
-# Linux/Mac
-./start_bot.sh
-
-# Ou manuellement
+# Windows / Linux / Mac
 npm start
 ```
 

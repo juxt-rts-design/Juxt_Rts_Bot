@@ -15,13 +15,7 @@ L'interface web JUXT_RTS Bot vous permet de gérer les sessions WhatsApp de mani
 ### Option 1 : Script automatique (Recommandé)
 
 ```bash
-# Windows
-start-web.bat
-
-# Linux/Mac
-./start-web.sh
-
-# Ou via npm
+# Toutes plateformes
 npm run web
 ```
 

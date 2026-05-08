@@ -1,4 +1,4 @@
-# 📝 Changelog - Juxt_Rts Bot v2.0
+﻿# 📝 Changelog - Juxt_Rts Bot v2.0
 
 ## [2.0.0] - 2024-12-19
 
@@ -32,9 +32,9 @@
 - `fallbackHandler.js` : Gestionnaire de fallback
 - `bot_with_fallback.js` : Bot principal avec système de fallback
 - `server_with_fallback.js` : Serveur Express avec API
-- `test_fallback.js` : Script de test automatisé
+- `npm test` : Commande de test
 - `env.example` : Configuration d'environnement
-- `start_bot.bat` / `start_bot.sh` : Scripts de démarrage
+- `npm start` : Démarrage du bot
 - `README_FALLBACK.md` : Documentation technique
 - `GUIDE_UTILISATION.md` : Guide utilisateur
 - `CHANGELOG.md` : Ce fichier

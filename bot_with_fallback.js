@@ -13,6 +13,9 @@ const FallbackHandler = require('./fallbackHandler');
 const ytdl = require('@distube/ytdl-core');
 const puppeteer = require('puppeteer');
 const fbDownloader = require('fb-downloader-scrapper');
+const sharp = require('sharp');
+const ffmpegPath = require('ffmpeg-static');
+const webp = require('webp-converter');
 
 // Configuration
 require('dotenv').config();
@@ -20,17 +23,64 @@ require('dotenv').config();
 const PREFIX = process.env.PREFIX || '-';
 const CREATOR_CONTACT = process.env.CREATOR_CONTACT || '+241076234942@s.whatsapp.net';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const SESSION_DIR = process.env.SESSION_DIR || './auth_info';
 
 // Système de conversation intelligent
 const conversationContext = new Map(); // Stocke le contexte par utilisateur
 const lastMessages = new Map(); // Stocke les derniers messages par utilisateur
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const GEMINI_MODEL_CANDIDATES = (process.env.GEMINI_MODEL_CANDIDATES ||
+    `${GEMINI_MODEL},gemini-2.0-flash,gemini-1.5-flash-latest,gemini-1.5-flash,gemini-pro`)
+    .split(',')
+    .map(m => m.trim())
+    .filter(Boolean);
+const GEMINI_MAX_OUTPUT_TOKENS = parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 8192;
 const GEMINI_TIMEOUT = parseInt(process.env.GEMINI_TIMEOUT) || 5000; // Réduit à 5s
 const MAX_GEMINI_RETRIES = parseInt(process.env.MAX_GEMINI_RETRIES) || 0; // Pas de retry
+const OPENROUTER_MODELS = (process.env.OPENROUTER_MODELS ||
+    'openrouter/auto,google/gemini-2.0-flash-exp:free,qwen/qwen3-coder:free')
+    .split(',')
+    .map(m => m.trim())
+    .filter(Boolean);
+const OPENROUTER_TIMEOUT = parseInt(process.env.OPENROUTER_TIMEOUT_MS) || 6000;
+const OPENROUTER_TOTAL_TIMEOUT = parseInt(process.env.OPENROUTER_TOTAL_TIMEOUT_MS) || 8000;
+const WS_CONNECT_TIMEOUT_MS = parseInt(process.env.WS_CONNECT_TIMEOUT_MS) || 60000;
+const MAX_RECONNECT_DELAY_MS = parseInt(process.env.MAX_RECONNECT_DELAY_MS) || 60000;
+const MEDIA_CONVERT_TIMEOUT_MS = parseInt(process.env.MEDIA_CONVERT_TIMEOUT_MS) || 10000;
+const COMMANDS_ONLY_MODE = String(process.env.COMMANDS_ONLY_MODE || 'false').toLowerCase() === 'true';
+const AI_SYSTEM_STYLE = `Tu t'appelles Juxt_rts Jr. Tu es l'assistant de Juxt_Rts.
+Parle en français, style humain, naturel, décontracté et familier.
+Ne commence pas chaque message par "bonjour".
+Préfère des réponses courtes, claires, utiles, sans blabla inutile.
+Quand on te demande ton nom/qui tu es, réponds clairement que tu es Juxt_rts Jr, assistant de Juxt_Rts.
+
+Tes domaines fondamentaux (tu dois être très solide et naturel dessus) :
+1) Développement web et application (frontend, backend, mobile, architecture, APIs, bases de données, débogage, bonnes pratiques).
+2) Informatique et technologies en général (systèmes, réseaux, tooling, productivité dev, sécurité).
+3) Hacking éthique / pentest (reconnaissance, méthodologie, OWASP, outils, mitigation, toujours dans un cadre légal et responsable).
+4) Jeux vidéo avec focus Call of Duty Mobile.
+5) Sports de combat : UFC, ONE Championship, Glory, MMA, kickboxing, muay thaï, boxe anglaise.
+
+Tu peux aussi parler de culture générale, mais tes sujets favoris restent ceux ci-dessus.
+Football: tu peux en parler simplement, mais sans en faire ton sujet principal.
+
+Style de réponse:
+- naturel, comme un humain, pas robotique
+- pas de gros pavés inutiles
+- adapte le niveau selon la question
+- reste clair, concret et utile
+
+Règle d'identité:
+- Ne te présentes pas automatiquement à chaque message.
+- Ne dis ton nom "Juxt_rts Jr" et ton rôle d'assistant de Juxt_Rts que si l'utilisateur te demande explicitement qui tu es, ton nom, ou ton rôle.`;
 
 // Debug des variables d'environnement
 console.log('🔧 Configuration chargée:');
 console.log('GEMINI_API_KEY:', GEMINI_API_KEY ? '✅ Configuré' : '❌ Non configuré');
+console.log('OPENROUTER_API_KEY:', OPENROUTER_API_KEY ? '✅ Configuré' : '❌ Non configuré');
+console.log('GEMINI_MODEL:', GEMINI_MODEL);
+console.log('GEMINI_MAX_OUTPUT_TOKENS:', GEMINI_MAX_OUTPUT_TOKENS);
 console.log('CREATOR_CONTACT:', CREATOR_CONTACT);
 console.log('SESSION_DIR:', SESSION_DIR);
 
@@ -43,12 +93,141 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
+let activeGeminiModel = GEMINI_MODEL;
+let geminiBackoffUntil = 0;
+let openRouterBackoffUntil = 0;
+let activeOpenRouterModel = OPENROUTER_MODELS[0] || 'openrouter/auto';
+
+function isGeminiQuotaError(message = '') {
+    const lower = String(message).toLowerCase();
+    return lower.includes('429') ||
+           lower.includes('quota exceeded') ||
+           lower.includes('too many requests') ||
+           lower.includes('rate-limits');
+}
+
+function isQuotaOrRateLimitError(message = '') {
+    const lower = String(message).toLowerCase();
+    return lower.includes('429') ||
+           lower.includes('quota') ||
+           lower.includes('too many requests') ||
+           lower.includes('rate limit');
+}
+
+function createGeminiModel(modelName = activeGeminiModel) {
+    return genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: {
+            maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
+        }
+    });
+}
+
+async function generateGeminiContentWithFallback(promptPayload) {
+    if (Date.now() < geminiBackoffUntil) {
+        throw new Error('Gemini temporairement désactivé (quota/rate limit)');
+    }
+
+    const modelsToTry = [activeGeminiModel, ...GEMINI_MODEL_CANDIDATES].filter((m, i, arr) => m && arr.indexOf(m) === i);
+    let lastError = null;
+
+    for (const modelName of modelsToTry) {
+        try {
+            const model = createGeminiModel(modelName);
+            const result = await Promise.race([
+                model.generateContent(promptPayload),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error(`Timeout (${modelName})`)), GEMINI_TIMEOUT)
+                )
+            ]);
+            activeGeminiModel = modelName;
+            return result;
+        } catch (error) {
+            lastError = error;
+            console.log(`⚠️ Modèle Gemini indisponible: ${modelName} (${error.message})`);
+            if (isGeminiQuotaError(error.message)) {
+                // Evite de spammer l'API quand le quota est épuisé
+                geminiBackoffUntil = Date.now() + 5 * 60 * 1000;
+                break;
+            }
+        }
+    }
+
+    throw lastError || new Error('Aucun modèle Gemini disponible');
+}
+
+async function generateOpenRouterTextWithFallback(prompt) {
+    if (!OPENROUTER_API_KEY) {
+        throw new Error('OpenRouter non configuré');
+    }
+    if (Date.now() < openRouterBackoffUntil) {
+        throw new Error('OpenRouter temporairement désactivé (quota/rate limit)');
+    }
+
+    const modelsToTry = [activeOpenRouterModel, ...OPENROUTER_MODELS]
+        .filter((m, i, arr) => m && arr.indexOf(m) === i);
+    let lastError = null;
+
+    for (const modelName of modelsToTry) {
+        try {
+            const response = await axios.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                {
+                    model: modelName,
+                    messages: [{ role: 'user', content: prompt }],
+                    max_tokens: GEMINI_MAX_OUTPUT_TOKENS,
+                    temperature: 0.7
+                },
+                {
+                    timeout: OPENROUTER_TIMEOUT,
+                    headers: {
+                        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                        'HTTP-Referer': 'https://juxt-rts-bot.local',
+                        'X-Title': 'Juxt_Rts Bot'
+                    }
+                }
+            );
+
+            const content = response?.data?.choices?.[0]?.message?.content;
+            if (!content || !String(content).trim()) {
+                throw new Error(`Réponse vide (${modelName})`);
+            }
+
+            activeOpenRouterModel = modelName;
+            return String(content);
+        } catch (error) {
+            const message = error?.response?.data?.error?.message || error.message || String(error);
+            lastError = new Error(message);
+            console.log(`⚠️ Modèle OpenRouter indisponible: ${modelName} (${message})`);
+            if (isQuotaOrRateLimitError(message)) {
+                openRouterBackoffUntil = Date.now() + 60 * 1000;
+                break;
+            }
+        }
+    }
+
+    throw lastError || new Error('Aucun modèle OpenRouter disponible');
+}
+
 // Configuration du logger
 const logger = P({ level: 'silent' });
 
 // Cache anti-spam
 const messageCache = new Map();
 const CACHE_DURATION = 30000; // 30 secondes
+let reconnectAttempts = 0;
+const BOT_STARTUP_UNIX = Math.floor(Date.now() / 1000);
+
+function getMessageTimestampSeconds(msg) {
+    if (!msg?.messageTimestamp) return 0;
+    if (typeof msg.messageTimestamp === 'number') return msg.messageTimestamp;
+    if (typeof msg.messageTimestamp === 'object' && typeof msg.messageTimestamp.low === 'number') {
+        return msg.messageTimestamp.low;
+    }
+    const parsed = Number(msg.messageTimestamp);
+    return Number.isFinite(parsed) ? parsed : 0;
+}
 
 // Mots interdits
 const forbiddenWords = ['insulte', 'offensive', 'inapproprié', 'haine', 'violence'];
@@ -83,29 +262,66 @@ function cacheMessage(messageId) {
     messageCache.set(messageId, Date.now());
 }
 
+function safeUnlink(filePath) {
+    try {
+        if (filePath && fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+    } catch (error) {
+        // Sous Windows, le fichier peut rester verrouillé un court instant (EBUSY)
+        console.log(`⚠️ Nettoyage différé ignoré: ${filePath} (${error.message})`);
+    }
+}
+
+function getFfmpegExecutable() {
+    // Fallback sur "ffmpeg" si le binaire embarqué n'est pas dispo
+    return ffmpegPath || 'ffmpeg';
+}
+
+function getWebpmuxExecutable() {
+    const candidates = [];
+    if (process.platform === 'win32') {
+        candidates.push(path.join(__dirname, 'node_modules', 'webp-converter', 'bin', 'libwebp_win64', 'bin', 'webpmux.exe'));
+    } else if (process.platform === 'darwin') {
+        candidates.push(path.join(__dirname, 'node_modules', 'webp-converter', 'bin', 'libwebp_osx', 'bin', 'webpmux'));
+    } else {
+        candidates.push(path.join(__dirname, 'node_modules', 'webp-converter', 'bin', 'libwebp_linux', 'bin', 'webpmux'));
+    }
+    candidates.push('webpmux');
+    return candidates.find(p => p === 'webpmux' || fs.existsSync(p)) || 'webpmux';
+}
+
+async function execWithTimeout(command, timeoutMs = MEDIA_CONVERT_TIMEOUT_MS) {
+    return Promise.race([
+        execAsync(command),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout conversion (${timeoutMs}ms)`)), timeoutMs))
+    ]);
+}
+
 /**
  * Demande une réponse à Gemini AI avec fallback
  */
 async function askGeminiWithFallback(prompt, retryCount = 0) {
     try {
-        if (!genAI) {
-            throw new Error('Gemini AI non configuré');
+        // Persona + style conversationnel naturel
+        const frenchPrompt = `${AI_SYSTEM_STYLE}\n\nMessage utilisateur: ${prompt}`;
+
+        let responseText = '';
+        if (OPENROUTER_API_KEY) {
+            responseText = await Promise.race([
+                generateOpenRouterTextWithFallback(frenchPrompt),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('OpenRouter timeout global')), OPENROUTER_TOTAL_TIMEOUT)
+                )
+            ]);
+        } else {
+            if (!genAI) {
+                throw new Error('Gemini AI non configuré');
+            }
+            const result = await generateGeminiContentWithFallback(frenchPrompt);
+            const response = await result.response;
+            responseText = response.text();
         }
-
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        
-        // Forcer la réponse en français
-        const frenchPrompt = `IMPORTANT: Réponds UNIQUEMENT en français. Utilise un ton amical et professionnel. Voici la question: ${prompt}`;
-        
-        const result = await Promise.race([
-            model.generateContent(frenchPrompt),
-            new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Timeout')), GEMINI_TIMEOUT)
-            )
-        ]);
-
-        const response = await result.response;
-        let responseText = response.text();
         
         // Vérifier et forcer le français si nécessaire
         if (!isFrenchResponse(responseText)) {
@@ -114,10 +330,10 @@ async function askGeminiWithFallback(prompt, retryCount = 0) {
         
         return responseText;
     } catch (error) {
-        console.error('Erreur Gemini:', error.message);
+        console.error('Erreur IA:', error.message);
         
         // Pas de retry pour plus de rapidité
-        console.log('Gemini indisponible, utilisation du fallback JSON...');
+        console.log('IA indisponible, utilisation du fallback JSON...');
         const fallbackResponse = fallbackHandler.searchResponse(prompt);
         
         if (fallbackResponse) {
@@ -157,6 +373,78 @@ function isFrenchResponse(text) {
 }
 
 /**
+ * Réponses locales rapides pour conversation basique
+ */
+function getLocalChatReply(text) {
+    const t = String(text || '').toLowerCase().trim();
+    if (!t) return null;
+
+    if (t.includes('tu sert a quoi') || t.includes('tu sers a quoi') || t.includes('tu fais quoi')) {
+        return `Je suis ton bot WhatsApp polyvalent 🤖\n\n` +
+               `- Téléchargement vidéos (TikTok/YouTube/Facebook/Instagram)\n` +
+               `- Commandes média (\`-sticker\`, \`-image\`, \`-video\`)\n` +
+               `- Recherche (\`-find\`, \`-gimage\`)\n` +
+               `- Réponses IA/fallback en français\n\n` +
+               `Tape \`-menu\` et je te montre tout.`;
+    }
+
+    if (t.startsWith('yo') || t.startsWith('salut') || t.startsWith('hello') || t === 'sava?' || t === 'ca va ?' || t === 'ça va ?') {
+        return `Salut 👋 Je suis en ligne.\nTape \`-menu\` pour les commandes, ou envoie un lien vidéo pour téléchargement.`;
+    }
+
+    if (t.includes('quel année') || t.includes('quelle année')) {
+        return `Nous sommes en ${new Date().getFullYear()} 📅`;
+    }
+
+    return null;
+}
+
+function getProfileJidCandidates(targetJid) {
+    const candidates = [];
+    if (!targetJid) return candidates;
+    candidates.push(targetJid);
+    if (targetJid.endsWith('@lid')) {
+        candidates.push(targetJid.replace('@lid', '@s.whatsapp.net'));
+    }
+    return [...new Set(candidates)];
+}
+
+async function processProfilePictureCommand(sock, msg, jid) {
+    try {
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const targetJid = ctx?.participant || jid;
+        const candidates = getProfileJidCandidates(targetJid);
+        let profileUrl = null;
+
+        for (const candidate of candidates) {
+            try {
+                profileUrl = await sock.profilePictureUrl(candidate, 'image');
+                if (profileUrl) break;
+            } catch (_) {
+                // Essai suivant
+            }
+        }
+
+        if (!profileUrl) {
+            await sock.sendMessage(jid, {
+                text: '😅 Pas de photo de profil récupérable (compte privé ou sans photo).'
+            });
+            return;
+        }
+
+        await sock.sendMessage(jid, {
+            image: { url: profileUrl },
+            caption: '📸 Voilà la photo de profil.'
+        });
+    } catch (error) {
+        console.error('❌ Erreur commande pp:', error.message);
+        await sock.sendMessage(jid, {
+            text: '😅 Impossible de récupérer la photo de profil pour le moment.'
+        });
+    }
+}
+
+/**
  * Détecte si un message contient un lien vidéo
  */
 function detectVideoLink(message) {
@@ -166,7 +454,7 @@ function detectVideoLink(message) {
         // YouTube patterns (incluant les Shorts)
         /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|m\.youtube\.com\/watch\?v=|youtube\.com\/shorts\/|youtube\.com\/shorts\/)/i,
         /(?:https?:\/\/)?(?:www\.)?(?:instagram\.com\/p\/|instagram\.com\/reel\/|instagram\.com\/tv\/)/i,
-        /(?:https?:\/\/)?(?:www\.)?(?:tiktok\.com\/@.*\/video\/|vm\.tiktok\.com\/)/i,
+        /(?:https?:\/\/)?(?:www\.)?(?:tiktok\.com\/@.*\/video\/|vm\.tiktok\.com\/|vt\.tiktok\.com\/)/i,
         /(?:https?:\/\/)?(?:www\.)?(?:pinterest\.(com|fr)\/pin\/)/i,
         /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com\/.*\/status\/|x\.com\/.*\/status\/)/i,
         /(?:https?:\/\/)?(?:www\.)?(?:vimeo\.com\/)/i,
@@ -252,8 +540,7 @@ async function processImageSearch(sock, jid, quotedMsg) {
         try {
             const prompt = `IMPORTANT: Réponds UNIQUEMENT en français. Analyse cette image et donne-moi des informations détaillées sur ce qu'elle contient. Décris l'objet, le lieu, la personne, ou tout ce qui est visible. Si tu peux identifier des marques, des lieux célèbres, ou des objets spécifiques, mentionne-les.`;
             
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const response = await model.generateContent([
+            const response = await generateGeminiContentWithFallback([
                 prompt,
                 {
                     inlineData: {
@@ -591,8 +878,7 @@ async function processAudioMessage(sock, jid, msg) {
             console.log('🎵 Début transcription avec Gemini...');
             const prompt = `IMPORTANT: Réponds UNIQUEMENT en français. Transcris cet audio en texte. Si tu ne peux pas entendre clairement, dis-le. Si c'est dans une autre langue, transcris dans cette langue puis traduis en français.`;
             
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const response = await model.generateContent([
+            const response = await generateGeminiContentWithFallback([
                 prompt,
                 {
                     inlineData: {
@@ -677,8 +963,7 @@ async function processAudioTranscription(sock, jid, quotedMsg) {
         try {
             const prompt = `IMPORTANT: Réponds UNIQUEMENT en français. Transcris cet audio en texte. Si tu ne peux pas entendre clairement, dis-le. Si c'est dans une autre langue, transcris dans cette langue puis traduis en français.`;
             
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const response = await model.generateContent([
+            const response = await generateGeminiContentWithFallback([
                 prompt,
                 {
                     inlineData: {
@@ -1796,17 +2081,31 @@ async function mediaToSticker(mediaPath, isVideo = false) {
         console.log(`📁 Source: ${mediaPath}`);
         console.log(`📁 Destination: ${outputPath}`);
         
+        const ffmpegExec = getFfmpegExecutable();
         let ffmpegCommand;
         if (isVideo) {
             // Pour les vidéos, prendre la première frame et la convertir en sticker
-            ffmpegCommand = `ffmpeg -i "${mediaPath}" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" -frames:v 1 -y "${outputPath}"`;
+            ffmpegCommand = `"${ffmpegExec}" -i "${mediaPath}" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" -frames:v 1 -y "${outputPath}"`;
         } else {
             // Pour les images, redimensionner et convertir en sticker (sans padding blanc)
-            ffmpegCommand = `ffmpeg -i "${mediaPath}" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" -y "${outputPath}"`;
+            ffmpegCommand = `"${ffmpegExec}" -i "${mediaPath}" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" -y "${outputPath}"`;
         }
         
         console.log(`🔧 Commande FFmpeg: ${ffmpegCommand}`);
-        await execAsync(ffmpegCommand);
+        try {
+            await execAsync(ffmpegCommand);
+        } catch (ffmpegError) {
+            // Fallback Windows: si ffmpeg absent, conversion image via sharp
+            if (!isVideo) {
+                console.log('⚠️ FFmpeg indisponible, fallback Sharp pour sticker image...');
+                await sharp(mediaPath)
+                    .resize(512, 512, { fit: 'cover' })
+                    .webp({ quality: 85 })
+                    .toFile(outputPath);
+            } else {
+                throw ffmpegError;
+            }
+        }
         
         if (fs.existsSync(outputPath)) {
             console.log('✅ Sticker créé avec succès');
@@ -1825,20 +2124,47 @@ async function mediaToSticker(mediaPath, isVideo = false) {
  * Convertit un sticker en image/vidéo
  */
 async function stickerToMedia(stickerPath, isVideo = false) {
-    try {
-        const outputPath = `./temp_media_${Date.now()}.${isVideo ? 'mp4' : 'png'}`;
-        
-        if (isVideo) {
-            await execAsync(`ffmpeg -i "${stickerPath}" -c:v libx264 -pix_fmt yuv420p "${outputPath}"`);
-        } else {
-            await execAsync(`ffmpeg -i "${stickerPath}" -c:v png "${outputPath}"`);
+    const outputPath = `./temp_media_${Date.now()}.${isVideo ? 'mp4' : 'png'}`;
+    const ffmpegExec = getFfmpegExecutable();
+    
+    if (isVideo) {
+        try {
+            await execWithTimeout(`"${ffmpegExec}" -i "${stickerPath}" -c:v libx264 -pix_fmt yuv420p "${outputPath}"`);
+        } catch (ffmpegError) {
+            console.log('⚠️ FFmpeg ne lit pas ce WebP animé, fallback webp-converter...');
+            const frameWebpPath = `./temp_frame_${Date.now()}.webp`;
+            const framePngPath = `./temp_frame_${Date.now()}.png`;
+            try {
+                const webpmuxExec = getWebpmuxExecutable();
+                await execWithTimeout(`"${webpmuxExec}" -get frame 1 "${stickerPath}" -o "${frameWebpPath}"`);
+                if (!fs.existsSync(frameWebpPath)) {
+                    throw new Error('Extraction frame WebP échouée');
+                }
+                await sharp(frameWebpPath).png({ quality: 100 }).toFile(framePngPath);
+                if (!fs.existsSync(framePngPath)) {
+                    throw new Error('Conversion frame PNG échouée');
+                }
+                await execWithTimeout(`"${ffmpegExec}" -loop 1 -i "${framePngPath}" -t 3 -c:v libx264 -pix_fmt yuv420p "${outputPath}"`);
+            } finally {
+                safeUnlink(frameWebpPath);
+                safeUnlink(framePngPath);
+            }
         }
-        
-        return outputPath;
-    } catch (error) {
-        console.error('Erreur conversion média:', error.message);
-        return null;
+    } else {
+        try {
+            await execWithTimeout(`"${ffmpegExec}" -i "${stickerPath}" -c:v png "${outputPath}"`);
+        } catch (ffmpegError) {
+            console.log('⚠️ FFmpeg indisponible, fallback Sharp pour conversion sticker -> image...');
+            await sharp(stickerPath)
+                .png({ quality: 100 })
+                .toFile(outputPath);
+        }
     }
+
+    if (!fs.existsSync(outputPath)) {
+        throw new Error('Fichier de sortie non généré');
+    }
+    return outputPath;
 }
 
 /**
@@ -1995,7 +2321,8 @@ async function processStickerToVideo(sock, jid, quotedMsg) {
 
             // Convertir WebP animé en MP4 avec ffmpeg
             console.log('🔄 Conversion WebP → MP4...');
-            const ffmpegCommand = `ffmpeg -i "${tempStickerPath}" -vf "scale=512:512" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -r 10 "${outputVideoPath}"`;
+            const ffmpegExec = getFfmpegExecutable();
+            const ffmpegCommand = `"${ffmpegExec}" -i "${tempStickerPath}" -vf "scale=512:512" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -r 10 "${outputVideoPath}"`;
             
             await execAsync(ffmpegCommand);
             
@@ -2063,12 +2390,15 @@ async function checkIfAnimatedWebP(buffer) {
  * Traite la commande image
  */
 async function processImageCommand(sock, jid, quotedMsg) {
+    let tempPath = null;
+    let imagePath = null;
+    let sentSuccessfully = false;
     try {
         await sock.sendMessage(jid, {
             text: '📸 Je convertis ton sticker en image... ⏳'
         });
 
-        const stream = await downloadContentFromMessage(quotedMsg.stickerMessage, 'image');
+        const stream = await downloadContentFromMessage(quotedMsg.stickerMessage, 'sticker');
         let buffer = Buffer.from([]);
         for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
         const stickerBuffer = buffer;
@@ -2081,11 +2411,11 @@ async function processImageCommand(sock, jid, quotedMsg) {
         }
 
         // Sauvegarder temporairement
-        const tempPath = `./temp_sticker_${Date.now()}.webp`;
+        tempPath = `./temp_sticker_${Date.now()}.webp`;
         fs.writeFileSync(tempPath, stickerBuffer);
 
         // Convertir en image
-        const imagePath = await stickerToMedia(tempPath, false);
+        imagePath = await stickerToMedia(tempPath, false);
         
         if (imagePath) {
             const imageBuffer = fs.readFileSync(imagePath);
@@ -2093,10 +2423,11 @@ async function processImageCommand(sock, jid, quotedMsg) {
                 image: imageBuffer,
                 caption: '📸 Voilà ton image ! 😊'
             });
+            sentSuccessfully = true;
             
             // Nettoyer
-            fs.unlinkSync(tempPath);
-            fs.unlinkSync(imagePath);
+            safeUnlink(tempPath);
+            safeUnlink(imagePath);
         } else {
             await sock.sendMessage(jid, {
                 text: '😅 Désolé, j\'ai eu un problème avec la conversion. Réessaie ! 🤗'
@@ -2104,9 +2435,14 @@ async function processImageCommand(sock, jid, quotedMsg) {
         }
     } catch (error) {
         console.error('Erreur image:', error.message);
-        await sock.sendMessage(jid, {
-            text: '😅 Oups ! Erreur lors de la conversion. Réessaie ! 🤗'
-        });
+        if (!sentSuccessfully) {
+            await sock.sendMessage(jid, {
+                text: '😅 Oups ! Erreur lors de la conversion. Réessaie ! 🤗'
+            });
+        }
+    } finally {
+        safeUnlink(tempPath);
+        safeUnlink(imagePath);
     }
 }
 
@@ -2137,26 +2473,19 @@ async function processVideoCommand(sock, jid, quotedMsg) {
 
         // Convertir en vidéo
         const videoPath = await stickerToMedia(tempPath, true);
+        const videoBuffer = fs.readFileSync(videoPath);
+        await sock.sendMessage(jid, {
+            video: videoBuffer,
+            caption: '🎬 Voilà ta vidéo ! 😊'
+        });
         
-        if (videoPath) {
-            const videoBuffer = fs.readFileSync(videoPath);
-            await sock.sendMessage(jid, {
-                video: videoBuffer,
-                caption: '🎬 Voilà ta vidéo ! 😊'
-            });
-            
-            // Nettoyer
-            fs.unlinkSync(tempPath);
-            fs.unlinkSync(videoPath);
-        } else {
-            await sock.sendMessage(jid, {
-                text: '😅 Désolé, j\'ai eu un problème avec la conversion. Réessaie ! 🤗'
-            });
-        }
+        // Nettoyer
+        safeUnlink(tempPath);
+        safeUnlink(videoPath);
     } catch (error) {
         console.error('Erreur vidéo:', error.message);
         await sock.sendMessage(jid, {
-            text: '😅 Oups ! Erreur lors de la conversion. Réessaie ! 🤗'
+            text: '😅 Impossible de convertir ce sticker animé pour le moment.\n\nEssaie un autre sticker ou renvoie-le, certains formats WhatsApp sont capricieux.'
         });
     }
 }
@@ -2669,6 +2998,9 @@ async function startBot() {
         logger,
         auth: state,
         browser: ['Juxt_Rts Bot', 'Chrome', '1.0.0'],
+        connectTimeoutMs: WS_CONNECT_TIMEOUT_MS,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000,
         generateHighQualityLinkPreview: true,
         retryRequestDelayMs: 1000,
         maxMsgRetryCount: 3,
@@ -2712,12 +3044,15 @@ async function startBot() {
             }
             
             if (shouldReconnect) {
-                console.log('🔄 Tentative de reconnexion dans 5 secondes...');
+                reconnectAttempts += 1;
+                const delayMs = Math.min(5000 * reconnectAttempts, MAX_RECONNECT_DELAY_MS);
+                console.log(`🔄 Tentative de reconnexion #${reconnectAttempts} dans ${Math.round(delayMs / 1000)} secondes...`);
                 setTimeout(() => {
                     startBot();
-                }, 5000);
+                }, delayMs);
             }
         } else if (connection === 'open') {
+            reconnectAttempts = 0;
             console.log('✅ Connecté à WhatsApp !');
             
             // Message de confirmation au créateur (avec délai pour éviter les erreurs)
@@ -2749,11 +3084,23 @@ sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         
         if (!msg.message) return;
+        if (m.type !== 'notify') return;
+        if (msg.message.protocolMessage) return;
+
+        const messageTimestamp = getMessageTimestampSeconds(msg);
+        if (messageTimestamp && messageTimestamp < BOT_STARTUP_UNIX) {
+            return;
+        }
         
         
         // Debug pour comprendre la structure des messages
         const messageType = Object.keys(msg.message || {})[0];
         console.log('🔍 Type de message détecté:', messageType);
+
+        // Ignorer les messages techniques WhatsApp non exploitables
+        if (messageType === 'senderKeyDistributionMessage') {
+            return;
+        }
         
         if (messageType === 'ephemeralMessage') {
             console.log('🔍 Contenu ephemeralMessage:', JSON.stringify(msg.message.ephemeralMessage, null, 2));
@@ -2772,6 +3119,15 @@ sock.ev.on('messages.upsert', async (m) => {
                           msg.message.viewOnceMessage?.message?.extendedTextMessage?.text ||
                           msg.message.viewOnceMessageV2?.message?.conversation ||
                           msg.message.viewOnceMessageV2?.message?.extendedTextMessage?.text || '';
+        const isCommandFromText = (messageText || '').trim().startsWith(PREFIX);
+        const isVideoLinkMessage = !!(messageText || '').trim() && detectVideoLink(messageText);
+        
+        // En mode commandes uniquement, on laisse passer:
+        // - les commandes préfixées
+        // - les liens vidéo (TikTok/YouTube/etc.) pour téléchargement auto
+        if (COMMANDS_ONLY_MODE && !isCommandFromText && !isVideoLinkMessage) {
+            return;
+        }
         
         console.log('🔍 MessageText extrait:', messageText);
         
@@ -2779,9 +3135,16 @@ sock.ev.on('messages.upsert', async (m) => {
         const jid = msg.key.remoteJid;
         const isGroup = jid.endsWith('@g.us');
         const isFromMe = msg.key.fromMe;
+
+        // Ignorer totalement les statuts / broadcasts WhatsApp
+        if (jid === 'status@broadcast') {
+            return;
+        }
         
-        // Ignorer les messages du bot
-        if (isFromMe) return;
+        // Ignorer les messages envoyés par le bot, sauf:
+        // - commandes explicites
+        // - liens vidéo (pour déclencher les téléchargements depuis son propre chat)
+        if (isFromMe && !isCommandFromText && !isVideoLinkMessage) return;
         
         // Anti-spam
         if (isMessageCached(messageId)) return;
@@ -2855,8 +3218,10 @@ sock.ev.on('messages.upsert', async (m) => {
         const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
         const isQuotedBot = quotedMsg && quotedMsg.key && quotedMsg.key.fromMe;
         
-        // Vérifier si le bot est mentionné
-        const isMentioned = messageText.includes('@' + sock.user.id.split('@')[0]);
+        // Vérifier si le bot est mentionné (méthode robuste WhatsApp)
+        const botJid = sock.user?.id;
+        const mentionedJids = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+        const isMentioned = !!botJid && mentionedJids.includes(botJid);
         
         // Vérifier si c'est une commande
         const isCommand = messageText.startsWith(PREFIX);
@@ -2871,11 +3236,11 @@ sock.ev.on('messages.upsert', async (m) => {
         let shouldRespond = false;
         
         if (!isGroup) {
-            // Dans les messages privés : répondre si c'est une commande, un mot-clé, ou une réponse au bot
-            shouldRespond = isCommand || hasKeyword || isQuotedBot;
+            // En inbox, répondre aux nouveaux messages (même sans commande)
+            shouldRespond = true;
         } else {
-            // Dans les groupes : répondre si c'est une commande, un mot-clé, une mention, ou une réponse au bot
-            shouldRespond = isCommand || hasKeyword || isMentioned || isQuotedBot;
+            // En groupe, ignorer si non mentionné (sauf commande explicite ou réponse au bot)
+            shouldRespond = isMentioned || isQuotedBot || isCommand;
         }
         
         // Vérifier si c'est un lien vidéo (toujours traiter les liens vidéo)
@@ -2906,7 +3271,7 @@ sock.ev.on('messages.upsert', async (m) => {
         
         // Si on ne doit pas répondre, ignorer le message
         if (!shouldRespond) {
-            console.log(`Message ignoré : pas de commande, pas de mention, pas de réponse au bot.`);
+            console.log(`Message ignoré : groupe sans mention du bot.`);
             return; // Ignorer le message
         }
 
@@ -3053,6 +3418,10 @@ sock.ev.on('messages.upsert', async (m) => {
                     
                 case 'menu':
                     await showMenu(sock, jid);
+                    break;
+                
+                case 'pp':
+                    await processProfilePictureCommand(sock, msg, jid);
                     break;
                     
                 case 'sticker':
@@ -5000,6 +5369,27 @@ sock.ev.on('messages.upsert', async (m) => {
                         });
                     }
                     break;
+            }
+        } else {
+            const cleanText = messageText.trim();
+            if (!cleanText) return;
+            
+            const localReply = getLocalChatReply(cleanText);
+            if (localReply) {
+                await sock.sendMessage(jid, { text: localReply });
+                return;
+            }
+
+            try {
+                const aiResponse = await askGeminiWithFallback(cleanText);
+                if (aiResponse && aiResponse.trim()) {
+                    await sock.sendMessage(jid, { text: aiResponse });
+                }
+            } catch (error) {
+                console.error('❌ Erreur réponse IA:', error.message);
+                await sock.sendMessage(jid, {
+                    text: '😅 Oups ! Petit souci temporaire, peux-tu réessayer ?'
+                });
             }
         }
     });

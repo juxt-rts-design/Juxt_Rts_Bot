@@ -32,13 +32,7 @@ FALLBACK_ENABLED=true
 
 ### 3. Démarrage
 ```bash
-# Windows
-start_bot.bat
-
-# Linux/Mac
-./start_bot.sh
-
-# Ou manuellement
+# Toutes plateformes
 npm start
 ```
 
@@ -139,7 +133,7 @@ curl http://localhost:3000/stats
 npm test
 
 # Test manuel
-node test_fallback.js
+# Aucun script manuel séparé actuellement
 ```
 
 ### Métriques de performance
@@ -169,7 +163,7 @@ cat .env
 ls -la fallback_responses.json
 
 # Tester le fallback
-node test_fallback.js
+npm test
 ```
 
 #### Gemini ne répond pas
@@ -222,7 +216,7 @@ cp .env backup/env_$(date +%Y%m%d).env
 1. Ouvrir `fallback_responses.json`
 2. Ajouter dans la catégorie appropriée
 3. Définir les mots-clés de recherche
-4. Tester avec `node test_fallback.js`
+4. Tester avec `npm test`
 
 ### Structure d'une réponse
 ```json
