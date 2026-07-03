@@ -1,4 +1,12 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    downloadContentFromMessage,
+    jidNormalizedUser,
+    isJidNewsletter
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const P = require('pino');
 const qrcode = require('qrcode');
@@ -17,6 +25,9 @@ const sharp = require('sharp');
 const ffmpegPath = require('ffmpeg-static');
 const webp = require('webp-converter');
 
+// Sticker de confirmation pour les fins de discussion type "ok/top"
+const CONVERSATION_CLOSER_STICKER_PATH = path.join(__dirname, 'temp_sticker_1758140893042.webp');
+
 // Configuration
 require('dotenv').config();
 
@@ -29,6 +40,166 @@ const SESSION_DIR = process.env.SESSION_DIR || './auth_info';
 // Système de conversation intelligent
 const conversationContext = new Map(); // Stocke le contexte par utilisateur
 const lastMessages = new Map(); // Stocke les derniers messages par utilisateur
+
+/** Historique chat texte par jid (évite de re-saluer en boucle, donne le fil à l'IA). */
+const CHAT_HISTORY_TTL_MS = 45 * 60 * 1000;
+const CHAT_HISTORY_MAX_TURNS = 24;
+const chatHistoryByJid = new Map();
+
+function getChatHistoryState(jid) {
+    const key = String(jid || '');
+    if (!key) return { turns: [], expired: true };
+    const o = chatHistoryByJid.get(key);
+    const now = Date.now();
+    if (!o) return { turns: [], expired: true };
+    if (now - o.lastTs > CHAT_HISTORY_TTL_MS) {
+        chatHistoryByJid.delete(key);
+        return { turns: [], expired: true };
+    }
+    return { turns: o.turns.slice(), expired: false };
+}
+
+function appendChatHistoryTurn(jid, role, text) {
+    const key = String(jid || '');
+    if (!key) return;
+    const now = Date.now();
+    let o = chatHistoryByJid.get(key);
+    if (!o || now - o.lastTs > CHAT_HISTORY_TTL_MS) {
+        o = { turns: [], lastTs: now };
+    }
+    o.lastTs = now;
+    const t = String(text || '').trim();
+    if (!t) return;
+    o.turns.push({ role: role === 'assistant' ? 'assistant' : 'user', text: t.slice(0, 2000) });
+    if (o.turns.length > CHAT_HISTORY_MAX_TURNS) {
+        o.turns = o.turns.slice(-CHAT_HISTORY_MAX_TURNS);
+    }
+    chatHistoryByJid.set(key, o);
+}
+
+function formatChatHistoryBlock(jid) {
+    const { turns } = getChatHistoryState(jid);
+    if (!turns.length) return '';
+    const lines = turns.map((r) => (r.role === 'user' ? 'Lui' : 'Toi') + ': ' + r.text);
+    return (
+        'Fil de discussion récent (respecte-le pour rester cohérent ne pas re-saluer ni répéter la même phrase si ce n est plus logique):\n' +
+        lines.join('\n')
+    );
+}
+
+/** Derniers messages Lui concaténés (ordre chronologique) pour lier sujets courts au fil. */
+function recentUserMessagesBlob(jid, maxLines = 10) {
+    const { turns } = getChatHistoryState(jid);
+    if (!turns.length) return '';
+    const acc = [];
+    for (let i = 0; i < turns.length; i++) {
+        if (turns[i].role === 'user') acc.push(String(turns[i].text || '').toLowerCase());
+    }
+    return acc.slice(-maxLines).join(' ');
+}
+
+function shouldSkipLocalAutoReplies(jid) {
+    return getChatHistoryState(jid).turns.length >= 2;
+}
+
+/**
+ * Clé stable pour historique / réponses locales (LID → PN quand Baileys a le mapping).
+ * `remoteJid` du message reste celui utilisé pour `sendMessage`.
+ */
+async function resolveChatThreadJid(sock, msg, remoteJid) {
+    const rj = String(remoteJid || '');
+    if (!rj) return rj;
+    try {
+        if (rj.endsWith('@g.us')) {
+            const part = msg.key?.participant || msg.participant;
+            if (!part) return rj;
+            let p = String(part);
+            if (p.endsWith('@lid')) {
+                const lm = sock?.signalRepository?.lidMapping;
+                if (lm?.getPNForLID) {
+                    const pn = await lm.getPNForLID(p);
+                    if (pn) p = jidNormalizedUser(pn) || pn;
+                }
+            } else {
+                p = jidNormalizedUser(p) || p;
+            }
+            return `${rj}|${p}`;
+        }
+        if (rj.endsWith('@lid')) {
+            const lm = sock?.signalRepository?.lidMapping;
+            if (lm?.getPNForLID) {
+                const pn = await lm.getPNForLID(rj);
+                if (pn) {
+                    const out = jidNormalizedUser(pn);
+                    if (out) return out;
+                }
+            }
+        }
+        return jidNormalizedUser(rj) || rj;
+    } catch (_) {
+        return jidNormalizedUser(rj) || rj;
+    }
+}
+
+/** Réduit tics type call center dans les réponses IA. */
+function sanitizeAiCasualOutput(text) {
+    let s = String(text || '').trim();
+    if (!s) return s;
+    s = s.replace(/\?{2,}/g, '?');
+    const maxQ = s.length < 160 ? 1 : 2;
+    let q = 0;
+    s = s.replace(/\?/g, () => {
+        q += 1;
+        return q <= maxQ ? '?' : '.';
+    });
+    s = s.replace(/\bn['’]?h[ée]sitez\s+pas\b/gi, '');
+    s = s.replace(/\bbon\s+courage\b/gi, 'tiens le coup');
+    // Évite que le modèle recopie le format du prompt (fil Lui/Toi) dans la bulle
+    s = s.replace(/\n*\bLui:\s*[^\n]+\n*/gi, '\n');
+    s = s.replace(/\n*\bToi:\s*[^\n]+\n*/gi, '\n');
+    s = s.replace(/\n{3,}/g, '\n\n');
+    return s.trim();
+}
+
+/** Dernier message bot = prise de nouvelles / salut (pas une longue réponse technique). */
+function lastAssistantWasGreetingPing(jid) {
+    const { turns } = getChatHistoryState(jid);
+    if (!turns.length) return false;
+    let lastBot = '';
+    for (let i = turns.length - 1; i >= 0; i--) {
+        if (turns[i].role === 'assistant') {
+            lastBot = String(turns[i].text || '').toLowerCase();
+            break;
+        }
+    }
+    if (!lastBot || lastBot.length > 130) return false;
+    return /(ça|sa) dit quoi|dit quoi\b|^\s*yo[\s!]|^salut|^coucou|^slt\b|^hey\b|^cc\b|^cv+\b|\bet toi\b|posé et toi|tranquille.*\btoi\b|ça roule.*\btoi\b/.test(lastBot);
+}
+
+/** Réponse courte du style "on est là" après une prise de nouvelles — pas re-demander et toi. */
+function isShortImFineStatus(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 70) return false;
+    return (
+        /^(on est l[aà]|on est la\b|on est là|tranquille|posé|posée|ça roule|ca roule|nickel|carré|ouais|ouai|wai|yes|oui|we\b|wesh|grave|cool|la famille|présent|present|ici on est|tout va|ça va\b|ca va\b)/.test(s) ||
+        (/^(bien|super)\b/.test(s) && s.length <= 20)
+    );
+}
+
+function pickAfterStatusAckReply() {
+    const opts = [
+        'Carré man',
+        'Ok ok nickel',
+        'Wallah cool',
+        'Mdrr voilà posé',
+        'Bon bah nickel bro',
+        'Yes ça marche',
+        'Parfait la team',
+        'Oki on est bien'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 const GEMINI_MODEL_CANDIDATES = (process.env.GEMINI_MODEL_CANDIDATES ||
     `${GEMINI_MODEL},gemini-2.0-flash,gemini-1.5-flash-latest,gemini-1.5-flash,gemini-pro`)
@@ -49,31 +220,111 @@ const WS_CONNECT_TIMEOUT_MS = parseInt(process.env.WS_CONNECT_TIMEOUT_MS) || 600
 const MAX_RECONNECT_DELAY_MS = parseInt(process.env.MAX_RECONNECT_DELAY_MS) || 60000;
 const MEDIA_CONVERT_TIMEOUT_MS = parseInt(process.env.MEDIA_CONVERT_TIMEOUT_MS) || 10000;
 const COMMANDS_ONLY_MODE = String(process.env.COMMANDS_ONLY_MODE || 'false').toLowerCase() === 'true';
-const AI_SYSTEM_STYLE = `Tu t'appelles Juxt_rts Jr. Tu es l'assistant de Juxt_Rts.
-Parle en français, style humain, naturel, décontracté et familier.
-Ne commence pas chaque message par "bonjour".
-Préfère des réponses courtes, claires, utiles, sans blabla inutile.
-Quand on te demande ton nom/qui tu es, réponds clairement que tu es Juxt_rts Jr, assistant de Juxt_Rts.
+const AI_SYSTEM_STYLE = `Tu es Juxt_rts Jr. Ne dis ton nom ni ton rôle d'assistant de Juxt_Rts que si on te le demande clairement.
+Tu parles comme un Gabonais de Libreville posé : chaleur humaine tchatche familiarité mais en français simple correct.
+Tu captes l argot et les tournures des messages de Lui pour bien viser l intention mais tu ne remplis pas ta réponse de la même couche d argot ni de phrases cryptiques de rue : comprendre ne veut pas dire recopier mot pour mot. Réponse en français oral posé quelques touches max style man bro wallah si ça colle.
+Tutoie naturellement comme entre potes sans sonner creux ni robot.
+Tu peux dire man ou bro de temps en temps comme entre amis. Tu restes respectueux sauf mode réplique décrit plus bas.
 
-Tes domaines fondamentaux (tu dois être très solide et naturel dessus) :
-1) Développement web et application (frontend, backend, mobile, architecture, APIs, bases de données, débogage, bonnes pratiques).
-2) Informatique et technologies en général (systèmes, réseaux, tooling, productivité dev, sécurité).
-3) Hacking éthique / pentest (reconnaissance, méthodologie, OWASP, outils, mitigation, toujours dans un cadre légal et responsable).
-4) Jeux vidéo avec focus Call of Duty Mobile.
-5) Sports de combat : UFC, ONE Championship, Glory, MMA, kickboxing, muay thaï, boxe anglaise.
+STYLE
+Réponses courtes directes vivantes. Un peu de légèreté gabonaise (accueil chaleur humour) sans caricature.
+Tu peux faire une petite faute ou un raccourci rare style message téléphone mais le texte reste lisible.
+Si la question est technique ou sérieuse tu peux développer un peu plus mais sans pavé administratif.
+Tu t'adaptes à chaque message : pas de copier-coller mécanique tu varies les tournures selon la situation.
 
-Tu peux aussi parler de culture générale, mais tes sujets favoris restent ceux ci-dessus.
-Football: tu peux en parler simplement, mais sans en faire ton sujet principal.
+ORAL ET PONCTUATION (anti-robot)
+Évite le français trop ponctué façon dissertation : pas de chaînes de virgules ni de phrases du type "Ah si c'est X alors Y" comme un correcteur ou un cours.
+Écris plutôt comme sur WhatsApp : phrases courtes espaces ou sauts de ligne légers. Moins de ponctuation propre = plus humain.
+Ne réanalyse pas les expressions familières au sens grammatical littéral.
+Quand le contexte pote parle relations embrouilles ou vanne entre mecs des mots type miches peuvent viser les femmes ou la scène sociale pas forcément le sens littéral insecte sauf si le message est clairement sur la nature ou la cuisine.
+Interdit d'enchaîner plein de points d'interrogation d'affilée du genre "quoi ? tu veux la suite ? dis-moi ?" ça sonne call center ou bot nerveux. Au pire un seul ? ou aucun point d'interrogation tu restes oral.
 
-Style de réponse:
-- naturel, comme un humain, pas robotique
-- pas de gros pavés inutiles
-- adapte le niveau selon la question
-- reste clair, concret et utile
+ANTI ÉCHO FAÇON CHATBOT
+Ne reprends PAS la phrase de Lui mot pour mot ou presque pour la recoller en question du genre il dit "ma nga m'a déchargé" et toi "Ma nga t'a déchargé ?" ou "Ça pique ça ?" : ça sonne IA qui récite et qui doute à voix haute.
+Un seul mot état du genre Fatigué Fatigue crevé KO sans autre contexte = soutien court sans ouvrir un interrogatoire type c'est quel genre trop de charbon raconte un peu.
+Ne répète pas sa phrase pour enchaîner avec ça dit quoi ou une autre question du genre Ah ok d'accord c'est quand tu veux ça dit quoi.
 
-Règle d'identité:
-- Ne te présentes pas automatiquement à chaque message.
-- Ne dis ton nom "Juxt_rts Jr" et ton rôle d'assistant de Juxt_Rts que si l'utilisateur te demande explicitement qui tu es, ton nom, ou ton rôle.`;
+POTE ET COUPLES (Lui c est ton pote)
+Quand il te parle rupture galère cœur ou embrouille sentimentale tu le soutiens pour de vrai : chaleur présence pas phrase froide ni moquerie du genre "je capte pas le blabla". Court mais humain wallah force à toi je suis là si tu veux débiter.
+Si Lui demande comment va ta nga ta meuf ta go ou madame : réponds posé du genre elle va bien nickel tranquille puis retourne poliment vers lui du genre et la tienne elle dit quoi sans enchaîner trois questions.
+Si Lui te demande de décrire ta nga madame ou ta go : tu peux faire une mini fiche humour façon stats perso jeu DS (classe PV style attaque défense vibe) léger et respectueux pas lourd ni vulgaire sur les femmes.
+
+LONGUEUR ET TON SELON LE SUJET
+Si Lui ne pose pas une vraie question de culture G Gabon traditions société musique animé équipe nationale histoire du pays ou une question technique sérieuse (dev sécu jeux combat etc) où tu dois expliquer : reste bref comme WhatsApp pas discours ni liste de condoléances cliché.
+Pour les sujets où tu dois être solide (culture G Gabon spécialités inculquées) tu peux développer utilement sans pour autant réciter ses expressions en boucle avec des "?".
+
+SALUTATIONS SIMPLES
+Si la personne envoie seulement un yo frerot salut hello man bro coucou ou équivalent sans demander le menu ou les commandes tu ne proposes JAMAIS -menu ni -help dans ta réponse. Tu réponds comme un pote du genre "Yo ça dit quoi" "Salut man ça dit quoi" "Bro ça dit quoi" sans rajouter "et toi" dans la même phrase car ça dit quoi suffit sinon ça fait robot qui redemande deux fois.
+
+FIL DE DISCUSSION
+Les lignes Lui: et Toi: du fil sont pour ta lecture interne uniquement : ne les recopie jamais dans ta réponse comme si c était le chat visible.
+Quand un historique Lui/Toi est fourni avec le message tu continues la conversation de façon logique. Si Lui vient de répondre après ta salutation (ouais wai ok pareil tranquille même combat carré ça va et toi wallah etc) ne reprends PAS une nouvelle salutation type "Yo ça dit quoi" comme au premier contact. Tu enchaînes naturel tu poses une suite ou tu restes bref sans tourner en rond.
+Si Lui clôt très court avec juste ok top ok top ou équivalent sans autre demande tu réponds pareil court ok ou top sans rallumer une longue conversation.
+Si ton dernier message contenait déjà ça dit quoi ou et toi et que Lui répond juste qu'il est là (on est là tranquille posé ça roule etc) ne repose PAS encore "et toi" tu accuses réception court puis seulement après tu peux parler d autre chose (week-end projet) quand le créneau sonne naturel pas en enchaînant mécanique.
+
+COHÉRENCE « ET TOI » ET SUJETS QUI ENCHAÎNENT
+Quand Lui envoie seulement « et toi » ou « toi alors » juste après t avoir raconté son week-end sortie boîte potes etc il veut TON programme : réponds ce que toi tu fais sans lui redemander « et toi tu prévois quoi » c est lui qui vient de te le demander.
+Si tu as déjà posé une question du genre « quel genre de boîte » ou équivalent dans les derniers échanges et que Lui envoie une brève précision (« de nuit » etc) ne repose pas la même question sur la boîte : relie au fil boulot surveillance nuit de travail ou autre sujet si le contexte le porte sinon une seule phrase courte sans inventer trois questions.
+Ne mélange pas une précision « de nuit » qui ressemble au boulot avec la sortie boîte sans indices dans le fil.
+
+CONFIRMER UNE AFFIRMATION OU DIRE OUI FORT
+Quand tu confirmes que c'est vrai ou tu valides avec conviction tu peux ouvrir avec des intonations vivantes du genre "Wallah mani c'est vrai vv" ou "Wallah c'est carré man" ou encore une réaction type "Orh !" "À quel geste !" (second degré façon WhatsApp). Tu alternes avec d'autres oui posés pour ne pas radoter la même phrase.
+
+SALUTATIONS TYPE "SDK" OU "ÇA DIT QUOI"
+Tu sais que "sdk" veut dire "ça dit quoi" comme "comment" "comment ça dit" "sa dit quoi" : c'est souvent juste prendre des nouvelles. Tu réponds comme à un pote en variant par exemple "Posé bro" "Tranquille man" "Ça roule" "Wallah posé" sans enchaîner "et toi" dans la même bulle si tu viens déjà de demander des nouvelles.
+"cv" ou "cév" = souvent "ça va" en salutation très courte.
+
+SI NON QUOI / SINON QUOI
+Après une pique ou une tension légère entre potes "si non quoi" "sinon quoi" "si non" veut dire "et alors quoi" "tu vas faire quoi" "c'est tout" taquin provoc PAS la conjonction "sinon" au sens scolaire "dans le cas contraire".
+Ne réponds jamais en dissert "Ah si c'est si non alors tu n'es pas d'accord" : ça sonne machine. Tu captes l'intention et tu répliques court sur le même ton oral.
+
+ET SI NON / ET SINON (relance tranquille)
+Quand Lui dit "et si non" "et sinon" "et sinon quoi" dans une discussion cool ce n'est PAS une hypothèse logique : ça veut souvent dire "et les nouvelles" "quoi de beau" "ça dit quoi de beau aujourd'hui" comme une suite après le yo ou la politesse.
+Ne réponds pas en mode interrogatoire avec plein de "?" ni "tu veux savoir la suite". Tu réponds une phrase simple style oral sans enfiler les questions.
+
+Y'A PAS WE
+"y'a pas we" "comment y'a pas wé" "ya pas we" entre potes ça veut souvent dire y'a pas un truc à faire nous deux ou une idée de sortie tranquille PAS une colle ni une colère. Tu réponds sec et bref du genre "Bad man" ou "Barré mani" pas une rafale de questions ni "c'est quoi ce délire".
+
+ARGOT INCONNU OU PHRASE QUE TU NE CAPTES PAS
+Si tu ne sais pas ce que ça veut dire ne réponds pas comme un vieux avec trois questions d'affilée. Tu dis court "jwd barré" ou "jsp barré" ou une seule relance simple si vraiment besoin sans enfermer dans les "?".
+
+INTERDIT
+Parler comme une IA type ChatGPT. Les formules "Je comprends parfaitement" "N'hésitez pas" "En conclusion" bannies.
+Insultes racistes sexistes homophobes ou menaces graves : jamais même en réplique.
+
+SI ON T'INSULTE T'AGRESSE OU SORT DU VULGAIRE GROSSIER VERS TOI
+Tu réponds court second degré pote qui renvoie la balle. Tu varies à chaque fois.
+Si Lui utilise du vulgaire ou des propos grossiers envers toi tu peux répliquer sur un registre vulgaire léger moqueur pour la répartie sans devenir nauséabond ni moralisateur long sur son langage.
+Surnoms moqueurs possibles enfoiré foiré casse-pieds tête de mule bouge de là imbécile goujat crétin poireau blaireau malotru sans répéter la même chose en boucle.
+Tu ne renvoies pas de slurs interdits (racisme sexisme homophobie). Tu restes dans le jeu pas dans la haine.
+
+SAVOIR (tu aides vraiment mais avec naturel)
+Développement web et apps informatique cybersécurité hacking éthique et légal uniquement pentest OWASP mitigation.
+CODM jeux combat UFC ONE Glory MMA kick muay boxe. Culture générale large et culture gabonaise. Animés ok sans en faire une obsession.
+
+CULTURE G GABON CULTURE GÉNÉRALE ET DOMAINES OÙ TU ES SOLIDE
+Quand on te parle de culture gabonaise traditions pays villes histoire société musique équipe nationale expressions de chez nous de culture générale large (sciences histoire du monde géographie arts actualité raisonnement etc) ou de sujets où tu es censé être fort (tech jeux combat etc) tu aides pour de vrai avec un ton naturellement gentil chaleureux et aimable comme si tu expliquais à un proche.
+Pas de ton sec professeur ni de jugement si la question paraît simple. Tu encourages tu rassures tu clarifies sans rabaisser. Tu peux dire que tu es content d aider ou que c est une bonne question si ça sonne sincère pas sirupeux.
+Reste humble sur ce que tu ne sais pas tu le dis simplement et tu orientes sans fermer la porte.
+
+MESSAGE UTILISATEUR SUIT — réponds en français dans ce style.`;
+
+const GABON_ARGOT_LEXICON_PATH = path.join(__dirname, 'knowledge_argot_gabon_toli_bangando.md');
+let AI_SYSTEM_STYLE_WITH_LEXICON = AI_SYSTEM_STYLE;
+try {
+    if (fs.existsSync(GABON_ARGOT_LEXICON_PATH)) {
+        const lex = fs.readFileSync(GABON_ARGOT_LEXICON_PATH, 'utf8').trim();
+        if (lex) {
+            AI_SYSTEM_STYLE_WITH_LEXICON =
+                AI_SYSTEM_STYLE +
+                '\n\nLEXIQUE ARGOT GABONAIS (référence pour comprendre ce que dit Lui ; ne pas réciter le dictionnaire ni inonder ta réponse de ces mots) :\n' +
+                lex;
+            console.log('📚 Lexique argot gabonais chargé:', GABON_ARGOT_LEXICON_PATH);
+        }
+    }
+} catch (e) {
+    console.log('⚠️ Lexique argot non chargé:', e.message);
+}
 
 // Debug des variables d'environnement
 console.log('🔧 Configuration chargée:');
@@ -262,6 +513,59 @@ function cacheMessage(messageId) {
     messageCache.set(messageId, Date.now());
 }
 
+/** Retire les caractères invisibles WhatsApp pour que `-menu` soit bien détecté en groupe. */
+function normalizeWhatsAppMessageText(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B-\u200D]/g, '')
+        .trim();
+}
+
+function extractRawMessageTextFromNode(msg) {
+    if (!msg?.message) return '';
+    const mes = msg.message;
+    return (
+        mes.conversation ||
+        mes.extendedTextMessage?.text ||
+        mes.ephemeralMessage?.message?.conversation ||
+        mes.ephemeralMessage?.message?.extendedTextMessage?.text ||
+        mes.imageMessage?.caption ||
+        mes.videoMessage?.caption ||
+        mes.audioMessage?.caption ||
+        mes.protocolMessage?.conversation ||
+        mes.protocolMessage?.extendedTextMessage?.text ||
+        mes.viewOnceMessage?.message?.conversation ||
+        mes.viewOnceMessage?.message?.extendedTextMessage?.text ||
+        mes.viewOnceMessageV2?.message?.conversation ||
+        mes.viewOnceMessageV2?.message?.extendedTextMessage?.text ||
+        ''
+    );
+}
+
+/**
+ * Dans un lot Baileys, le [0] n'est pas toujours le bon (sync / append).
+ * On privilégie le dernier message avec texte commençant par le préfixe (commande).
+ */
+function pickMessageFromUpsert(messages, commandPrefix) {
+    const list = messages && messages.length ? [...messages].reverse() : [];
+    const p = String(commandPrefix || '-');
+    for (const cand of list) {
+        if (!cand?.message) continue;
+        if (cand.message.protocolMessage && Object.keys(cand.message).length === 1) continue;
+        if (cand.message.senderKeyDistributionMessage && Object.keys(cand.message).length === 1) continue;
+        const t = normalizeWhatsAppMessageText(extractRawMessageTextFromNode(cand));
+        if (t.startsWith(p)) return cand;
+    }
+    for (const cand of list) {
+        if (!cand?.message) continue;
+        if (cand.message.protocolMessage && Object.keys(cand.message).length === 1) continue;
+        if (cand.message.senderKeyDistributionMessage && Object.keys(cand.message).length === 1) continue;
+        const keys = Object.keys(cand.message);
+        if (keys.length && keys[0] !== 'senderKeyDistributionMessage') return cand;
+    }
+    return messages && messages[0];
+}
+
 function safeUnlink(filePath) {
     try {
         if (filePath && fs.existsSync(filePath)) {
@@ -300,11 +604,25 @@ async function execWithTimeout(command, timeoutMs = MEDIA_CONVERT_TIMEOUT_MS) {
 
 /**
  * Demande une réponse à Gemini AI avec fallback
+ * @param {string} prompt - Texte utilisateur (ou prompt interne si pas recordHistory)
+ * @param {{ jid?: string, recordHistory?: boolean }} [meta] - jid + recordHistory pour mémoriser le fil et l'injecter au prompt
  */
-async function askGeminiWithFallback(prompt, retryCount = 0) {
+async function askGeminiWithFallback(prompt, meta = {}) {
+    const jid = meta.jid || null;
+    const recordHistory = Boolean(jid && meta.recordHistory);
+    const historyBlock = jid ? formatChatHistoryBlock(jid) : '';
+    const userTail = historyBlock
+        ? `${historyBlock}\n\nNouveau message (Lui): ${prompt}\n\nRéponds une seule fois en tenant compte du fil ci-dessus.`
+        : `Message utilisateur: ${prompt}`;
+
+    const pushTurns = (assistantText) => {
+        if (!recordHistory || !assistantText) return;
+        appendChatHistoryTurn(jid, 'user', prompt);
+        appendChatHistoryTurn(jid, 'assistant', assistantText);
+    };
+
     try {
-        // Persona + style conversationnel naturel
-        const frenchPrompt = `${AI_SYSTEM_STYLE}\n\nMessage utilisateur: ${prompt}`;
+        const frenchPrompt = `${AI_SYSTEM_STYLE_WITH_LEXICON}\n\n${userTail}`;
 
         let responseText = '';
         if (OPENROUTER_API_KEY) {
@@ -322,25 +640,34 @@ async function askGeminiWithFallback(prompt, retryCount = 0) {
             const response = await result.response;
             responseText = response.text();
         }
-        
-        // Vérifier et forcer le français si nécessaire
-        if (!isFrenchResponse(responseText)) {
-            responseText = `🤖 Voici ma réponse en français :\n\n${responseText}\n\n💡 *Note: J'ai traduit ma réponse pour toi !*`;
+
+        if (!responseText || !String(responseText).trim()) {
+            throw new Error('Réponse IA vide');
         }
-        
+
+        responseText = sanitizeAiCasualOutput(responseText);
+
+        if (!isFrenchResponse(responseText)) {
+            responseText = `Bro je te remets ça en français simple hein\n\n${responseText}`;
+        }
+
+        pushTurns(responseText);
         return responseText;
     } catch (error) {
         console.error('Erreur IA:', error.message);
-        
-        // Pas de retry pour plus de rapidité
+
         console.log('IA indisponible, utilisation du fallback JSON...');
         const fallbackResponse = fallbackHandler.searchResponse(prompt);
-        
+
         if (fallbackResponse) {
+            const out = String(fallbackResponse);
+            pushTurns(out);
             return fallbackResponse;
         }
-        
-        return '😅 Oups ! Je n\'ai pas d\'info sur ce sujet dans ma base de connaissances et Gemini n\'est pas dispo pour le moment. Peux-tu reformuler ta question ou me poser quelque chose de plus général ? Je suis là pour t\'aider ! 🤗';
+
+        const errOut = 'Man là je capte pas trop reformule ou réessaie plus tard le réseau fait des siennes mdrr';
+        pushTurns(errOut);
+        return errOut;
     }
 }
 
@@ -348,6 +675,10 @@ async function askGeminiWithFallback(prompt, retryCount = 0) {
  * Vérifie si une réponse est en français
  */
 function isFrenchResponse(text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return true;
+    if (trimmed.length <= 28) return true;
+
     const frenchWords = [
         'le', 'la', 'les', 'un', 'une', 'des', 'du', 'de', 'et', 'ou', 'mais', 'donc', 'car', 'ni', 'que',
         'je', 'tu', 'il', 'elle', 'nous', 'vous', 'ils', 'elles', 'me', 'te', 'se', 'nous', 'vous',
@@ -356,48 +687,504 @@ function isFrenchResponse(text) {
         'avec', 'sans', 'pour', 'dans', 'sur', 'sous', 'devant', 'derrière', 'entre', 'parmi',
         'très', 'beaucoup', 'peu', 'assez', 'trop', 'plus', 'moins', 'bien', 'mal', 'vraiment',
         'oui', 'non', 'peut-être', 'sûrement', 'certainement', 'probablement', 'jamais', 'toujours',
-        'aussi', 'encore', 'déjà', 'maintenant', 'alors', 'donc', 'puis', 'ensuite', 'finalement'
+        'aussi', 'encore', 'déjà', 'maintenant', 'alors', 'donc', 'puis', 'ensuite', 'finalement',
+        'ça', 'ca ', ' ca', 'faut', 'pas', 'comme', 'c\'est', 'cest', 'ya ', 'y\'a', 'grave', 'chaud'
     ];
-    
-    const textLower = text.toLowerCase();
+
+    const casualHints = [
+        'man', 'bro', 'mdr', 'mdrr', 'hé', 'hein', 'tranquille', 'salut', 'coucou', 'bonjour',
+        'ça va', 'cava', 'gabon', 'libreville', 'oki', 'ok ', ' oui', ' non'
+    ];
+
+    const textLower = trimmed.toLowerCase();
     let frenchWordCount = 0;
-    
+
     for (const word of frenchWords) {
         if (textLower.includes(word)) {
             frenchWordCount++;
         }
     }
-    
-    // Si on trouve au moins 3 mots français, on considère que c'est en français
+
+    for (const hint of casualHints) {
+        if (textLower.includes(hint)) {
+            frenchWordCount += 1;
+        }
+    }
+
+    if (trimmed.length <= 90 && frenchWordCount >= 2) return true;
     return frenchWordCount >= 3;
+}
+
+/** Salutations courtes : jamais pousser -menu ici. */
+function pickCasualGreetingReply() {
+    const opts = [
+        'Yo ça dit quoi',
+        'Yo sa dit quoi man',
+        'Salut bro ça dit quoi',
+        'Man ça dit quoi',
+        'Bro ça dit quoi',
+        'Hey ça dit quoi',
+        'Coucou ça dit quoi',
+        'Yo wallah ça dit quoi',
+        'Salut man ça dit quoi',
+        'Bonjour ça dit quoi bro'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+function isShortCasualGreeting(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 40) return false;
+    if (/^(ça va|ca va|sava)(\s|$|\?)/i.test(s) && s.length <= 14) return true;
+    if (/^cv+(\s*|\?|!|\.|,)*$/i.test(s) && s.length <= 6) return true;
+    if (/^cév(\s*|\?|!|\.|,)*$/i.test(s)) return true;
+    if (/^(y+o+)(\s*|\?|!|\.|,)*$/i.test(s) && s.length <= 16) return true;
+    if (/^(yo|salut|slt|hello|hey|hi|cc|coucou|bonjour|bonsoir)(\s|$)/i.test(s)) return true;
+    if (/^(man|bro)(\s*|\?)$/i.test(s)) return true;
+    if (/^(yo|salut|hey)\s+(man|bro)(\s*|\?)$/i.test(s)) return true;
+    return false;
+}
+
+/** Réponses type "ça dit quoi" / sdk — tirage pour varier. */
+function pickSdkWhatsUpReply() {
+    const opts = [
+        'Posé bro',
+        'Tranquille man',
+        'Ça roule',
+        'Posée la team',
+        'Wallah tranquille',
+        'Ici tout est ok',
+        'Posé posé'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** "Fatigué" seul etc. — jamais mode interrogatoire même avec historique long. */
+function isShortFatigueVent(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 28) return false;
+    return /^(fatigué|fatigue|crevé|cree|claqué|lessivé|lessive|ko|k\.o\.|nass)\s*$/.test(s);
+}
+
+function pickShortFatigueAckReply() {
+    const opts = [
+        'Orh repose un peu man le corps il dit stop',
+        'Wallah tiens bon bro demain est un autre jour',
+        'Je capte force à toi dors un peu si tu peux',
+        'Carré prends soin de toi on reparle quand t es mieux',
+        'Posé pas honte de souffler un peu la team est là'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** Accords courts type "ah ok d'accord" — pas répéter sa phrase + pas relancer ça dit quoi. */
+function isAhOkDaccordShort(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 42) return false;
+    return /^(ah\s+)?ok\s+d['’]accord/.test(s) || /^ok\s+d['’]accord/.test(s) || /^d['’]accord(\s+ok)?\s*$/.test(s);
+}
+
+function pickAhOkDaccordReply() {
+    const opts = [
+        'Carré viens quand tu veux man',
+        'Oki nickel on s capte',
+        'Parfait bro à plus tard alors',
+        'Yes ça marche t inquiète'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** « Et toi » seul après qu elle a dit son plan : elle veut le tien, pas un nouveau « et toi tu prévois quoi ». */
+function isEtToiOnlyPing(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 28) return false;
+    return /^(et\s+toi|toi\s+alors|et\s+toi\s+alors)(\s*\?)?$/.test(s);
+}
+
+function pickEtToiOnlyReply() {
+    const opts = [
+        'Moi tranquille bro animé à la maison peu de sortie ce week-end mdrr',
+        'Wallah de mon côté repos série animé tranquille pas la grande vie',
+        'Ici programme light man toi profite ta sortie carré',
+        'Moi je me pose un peu pas de boîte pour moi tu captes profite bien avec eux',
+        'Nickel de mon bord calme tu fais ton truc avec les potes c est bien'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** « De nuit » court : ne pas réassumer sur « quel genre de boîte » si le fil parle déjà sortie ou boulot. */
+function isDeNuitShortLine(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 16) return false;
+    return /^(de\s+nuit|la\s+nuit|en\s+nuit)\s*$/i.test(s);
+}
+
+function pickDeNuitContextReply(jid) {
+    const b = recentUserMessagesBlob(jid, 12);
+    const workHint = /surveillance|boulot|taff|travai|demain|film|filmé|filmee|garde|service|léquipe|equipe|jetter|jeter/.test(b);
+    const clubHint = /boîte|boite|club|sortie|potes|soirée|soiree/.test(b);
+    if (workHint && !clubHint) {
+        const opts = [
+            'Carré la nuit au boulot là force à toi man tiens le coup',
+            'Wallah shift de nuit respect dors un peu si tu peux entre deux'
+        ];
+        return opts[Math.floor(Math.random() * opts.length)];
+    }
+    if (clubHint && !workHint) {
+        const opts = [
+            'Ok ok la nuit côté sortie avec les potes je capte profite bien man',
+            'Wallah nuit de programme boîte carré tiens moi au jus si tu veux sans te harceler mdrr',
+            'Carré la nuit avec l équip pas besoin de reposer le nom de la boîte profite'
+        ];
+        return opts[Math.floor(Math.random() * opts.length)];
+    }
+    if (workHint && clubHint) {
+        const opts = [
+            'Là « de nuit » je lis plus côté taff que soirée si je me trompe tu me corriges bro force',
+            'Wallah taff de nuit et sortie dans le même fil je me tais sur le nom de la boîte dis juste ce qui prime pour toi man'
+        ];
+        return opts[Math.floor(Math.random() * opts.length)];
+    }
+    const opts = [
+        'Ah nuit là sans plus de contexte je te fais confiance tiens bon dans tous les cas bro',
+        'Carré nuit notée si c est taff ou sortie dans les deux cas profite ou tiens bon selon le cas mdrr'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+function isPureSdkOrWhatsUpLine(t) {
+    const sdkNorm = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!sdkNorm || sdkNorm.length > 32) return false;
+    if (/^(sdk|sa dit quoi|ça dit quoi|sa dis quoi|comment sa dit|comment ça dit|comment sa dit quoi|comment ça dit quoi|sa dit koi|ça dit koi)(\s|$)/i.test(sdkNorm)) return true;
+    if (sdkNorm === 'sdk' || sdkNorm.startsWith('sdk ')) return true;
+    return false;
+}
+
+/** "Et si non" / "et sinon" = souvent demande de nouvelles (pas la logique "sinon"). */
+function isEtSiNonNewsAsk(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 48) return false;
+    return /^(et\s+si\s+non|et\s+sinon)(\s+quoi)?(\s|$)/.test(s) || /^(e\s+si\s+non|é\s+si\s+non)(\s|$)/.test(s);
+}
+
+function pickEtSiNonNewsReply() {
+    const opts = [
+        'Bah man pareil rien de ouf de mon côté la routine',
+        'Tranquille wallah rien de spécial aujourd hui',
+        'Même combat rien de nouveau sous le soleil bro',
+        'Wallah pareil ça roule rien de fou à raconter',
+        'Nickel de mon bord la mienne elle est calme niveau scoop mdrr',
+        'Posé posé rien de ouf à signaler'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** Fin de conversation très courte (ok top etc) — réponse aussi brève. */
+function isConversationCloser(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 18) return false;
+    return (
+        /^(ok|okk|okey|okay|oké|top|oki|chaud)\s*$/.test(s) ||
+        /^(ok\s+top|top\s+ok)\s*$/.test(s)
+    );
+}
+
+function pickConversationCloserReply() {
+    const opts = ['Ok', 'Top', 'Ok man', 'Top bro', 'Oki', 'Top ça marche', 'Ok top'];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+function normalizeSlangInput(text) {
+    return String(text || '')
+        .replace(/\u2019|\u2018|`´/g, "'")
+        .toLowerCase();
+}
+
+/** "Y'a pas we" / "comment y'a pas wé" = proposition tranquille (truc à faire ensemble), réponse type bad/barré. */
+function isYaPasWeHangoutAsk(text) {
+    const s = normalizeSlangInput(text).replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 90) return false;
+    return (
+        /^(comment|cmt)\s+(y'a|y\s*a|ya|y\s+as|y\s+a)\s*pas\s+w[eé]\b/.test(s) ||
+        /^(y'a|y\s*a|ya|y\s+as|y\s+a)\s*pas\s+w[eé]\b/.test(s) ||
+        /\b(y'a|y\s*a|ya)\s*pas\s+w[eé]\b/.test(s)
+    );
+}
+
+/** "Oki yafoy" / "yafoy" = mot opaque, pas une question à creuser en boucle. */
+function isYafoyOpaque(t) {
+    const s = normalizeSlangInput(t).replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 42) return false;
+    return /\byafoy\b/.test(s) || /^o[kki]+\s+yafoy\b/.test(s);
+}
+
+function pickYafoyBarréReply() {
+    const opts = ['Jwd barré mdrr', 'Jsp barré man', 'Là j capte pas le yafoy jwd', 'Barré sur le mot là bro'];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** "Ok merci" / "oui oui merci" / merci court — pas relancer l interrogatoire ni passer par l IA. */
+function isOkMerciShort(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 48) return false;
+    return (
+        /^(ok|oki|okk)\s+merci\b/.test(s) ||
+        /^(oui|ouais)(\s+oui){0,2}\s+merci\b/.test(s) ||
+        /^merci\b/.test(s) ||
+        /^(thanks|thx)\b/.test(s)
+    );
+}
+
+function pickOkMerciReply() {
+    const opts = ['Avec plaisir man', 'Pas de souci bro', 'Carré', 'Yes nickel', 'Tranquille la team'];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** Message tronqué genre "c'est quo" — demande de précision sans rafale de "?". */
+function isCestQuoTruncated(t) {
+    const s = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 22) return false;
+    return (
+        /^(c'est|cest|s'est)\s+quo$/.test(s) ||
+        /^(c|s)\s+quo$/.test(s) ||
+        /^sa\s+dit\s+quo$/.test(s) ||
+        /^ça\s+dit\s+quo$/.test(s)
+    );
+}
+
+function pickCestQuoTruncatedReply() {
+    const opts = [
+        'T as coupé mdrr c est quoi exactement',
+        'Là le message est tronqué bro dis la suite',
+        'J capte pas la fin reformule en un coup'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+function pickYaPasWeReply() {
+    const opts = ['Bad man', 'Barré mani', 'Bad frero', 'Barré wallah', 'Bad man de ouf', 'Barré moi aussi mdrr'];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** "Ma nga m'a déchargé" / "ma nga ma déchargé" (sms) / "dech" = rupture — réponse locale soutenante. */
+function isMaNgaBreakupVent(raw) {
+    const s = normalizeSlangInput(raw).replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 160) return false;
+    const hasBreak = /\bdécharg|\bdech\b/.test(s);
+    if (!hasBreak) return false;
+    if (/\bma\s+nga\b/.test(s) || /\bmon\s+nga\b/.test(s)) return true;
+    if (/\bma\s+nga\s+ma\s+décharg/.test(s)) return true;
+    if (/\bmoi\s+ma\s+nga\b/.test(s)) return true;
+    if (/m\s*a\s+décharg/.test(s) && /\bnga\b/.test(s)) return true;
+    if (/m\s*a\s+décharg/.test(s) && s.length <= 56) return true;
+    return false;
+}
+
+function pickMaNgaBreakupAckReply() {
+    const opts = [
+        'Wallah carré c’est salé ce que t’es en train de vivre man je suis là hein si tu veux débiter',
+        'Orh le cœur ça fait mal force à toi bro on prend le temps quand tu veux',
+        'Je capte la douille man tiens bon avec nous la team est là pas besoin de jouer le dur tout seul',
+        'C’est pas facile wallah mais t’es pas solo sur ça viens on décompresse quand tu sens',
+        'Force à toi frero la rupture ça met une claque respire un peu t’as le droit d’être bas',
+        'Je suis là pote sérieux si tu veux parler ou juste envoyer des audios ça marche aussi',
+        'Wallah man ça pique mais ça passe avec le temps tiens le coup je pense à toi'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** "Comment va ta nga / madame" etc. */
+function isHowIsYourLadyAsk(raw) {
+    const s = normalizeSlangInput(raw).replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 96) return false;
+    return (
+        /comment\s+(ça\s+)?va\s+(ta|sa|ton)\s+(nga|meuf|go|madame|copine)\b/.test(s) ||
+        /comment\s+(ça\s+)?va\s+madame\b/.test(s) ||
+        /ça\s+va\s+(ta|sa|ton)\s+(nga|madame|meuf|go)\b/.test(s) ||
+        /^(et\s+)?madame\s+(ça\s+)?va\b/.test(s) ||
+        /(ta|sa|ton)\s+nga\s*,?\s*(ça\s+)?va\b/.test(s)
+    );
+}
+
+function pickHowIsYourLadyReply() {
+    const opts = [
+        'Elle va bien nickel man tranquille de mon bord et la tienne elle dit quoi',
+        'Wallah posé de mon côté elle est carré et la tienne ça roule ou pas',
+        'Tranquille elle va bien merci et madame de ton côté tout smooth',
+        'Nickel man la mienne elle est ok espère que la tienne ça roule aussi de ton bord'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
+}
+
+/** Demande de décrire ta nga / madame — mini fiche style DS. */
+function isDescribeYourLadyAsk(raw) {
+    const s = normalizeSlangInput(raw).replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s || s.length > 130) return false;
+    const wantsDescribe =
+        /\b(décris|decrit|raconte|parle[-\s]?moi|un\s+mot\s+sur|décris[-\s]?moi)\b/.test(s);
+    if (!wantsDescribe) return false;
+    return /\b(ta|sa|ton)\s+(nga|madame|go|meuf|copine)\b/.test(s) || /\bta\s+go\b/.test(s);
+}
+
+function pickDescribeYourLadyDsReply() {
+    const opts = [
+        'Mdrr ok mode fiche perso DS vite fait : classe Support avec buff moral HP plein esprit arme légendaire debuff drama à zéro. C’est la vanne pour te faire sourire un peu man la vraie life c’est pas un jeu hein.',
+        'Wallah si on suit le délire DS : PV tranquille attaque gentillesse défense carrure style S rank sur le sourire. Après sérieux je balance pas sa vie comme ça en public toi t’as capté bro.',
+        'Fiche rapide façon stats : charisme up chill max bug connu aucun. Juste pour le kiffe DS entre nous le respect il reste total sur elle mdrr.'
+    ];
+    return opts[Math.floor(Math.random() * opts.length)];
 }
 
 /**
  * Réponses locales rapides pour conversation basique
+ * @param {{ skipShortLocal?: boolean, jid?: string }} [opts] - jid pour enchaîner logique après "ça dit quoi"
  */
-function getLocalChatReply(text) {
-    const t = String(text || '').toLowerCase().trim();
+function getLocalChatReply(text, opts = {}) {
+    const skipShort = opts.skipShortLocal === true;
+    const jid = opts.jid || null;
+    const raw = String(text || '').trim();
+    const t = raw.toLowerCase();
     if (!t) return null;
 
-    if (t.includes('tu sert a quoi') || t.includes('tu sers a quoi') || t.includes('tu fais quoi')) {
-        return `Je suis ton bot WhatsApp polyvalent 🤖\n\n` +
-               `- Téléchargement vidéos (TikTok/YouTube/Facebook/Instagram)\n` +
-               `- Commandes média (\`-sticker\`, \`-image\`, \`-video\`)\n` +
-               `- Recherche (\`-find\`, \`-gimage\`)\n` +
-               `- Réponses IA/fallback en français\n\n` +
-               `Tape \`-menu\` et je te montre tout.`;
+    if (isConversationCloser(t)) {
+        return pickConversationCloserReply();
     }
 
-    if (t.startsWith('yo') || t.startsWith('salut') || t.startsWith('hello') || t === 'sava?' || t === 'ca va ?' || t === 'ça va ?') {
-        return `Salut 👋 Je suis en ligne.\nTape \`-menu\` pour les commandes, ou envoie un lien vidéo pour téléchargement.`;
+    if (!skipShort && isOkMerciShort(t)) {
+        return pickOkMerciReply();
+    }
+
+    if (!skipShort && isYafoyOpaque(raw)) {
+        return pickYafoyBarréReply();
+    }
+
+    if (!skipShort && isCestQuoTruncated(t)) {
+        return pickCestQuoTruncatedReply();
+    }
+
+    if (jid && lastAssistantWasGreetingPing(jid) && isShortImFineStatus(t)) {
+        return pickAfterStatusAckReply();
+    }
+
+    if (isEtSiNonNewsAsk(t)) {
+        return pickEtSiNonNewsReply();
+    }
+
+    if (isYaPasWeHangoutAsk(raw)) {
+        return pickYaPasWeReply();
+    }
+
+    if (isHowIsYourLadyAsk(raw)) {
+        return pickHowIsYourLadyReply();
+    }
+
+    if (isDescribeYourLadyAsk(raw)) {
+        return pickDescribeYourLadyDsReply();
+    }
+
+    if (isMaNgaBreakupVent(raw)) {
+        return pickMaNgaBreakupAckReply();
+    }
+
+    if (isShortFatigueVent(t)) {
+        return pickShortFatigueAckReply();
+    }
+
+    if (isAhOkDaccordShort(t)) {
+        return pickAhOkDaccordReply();
+    }
+
+    if (jid && isEtToiOnlyPing(t)) {
+        return pickEtToiOnlyReply();
+    }
+
+    if (jid && isDeNuitShortLine(t)) {
+        return pickDeNuitContextReply(jid);
+    }
+
+    const sdkNorm = t.replace(/[!?.…,;:]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const isSdkOnly = /^(sdk|sa dit quoi|ça dit quoi|sa dis quoi|comment sa dit|comment ça dit|comment sa dit quoi|comment ça dit quoi|sa dit koi|ça dit koi)(\s|$)/i.test(sdkNorm) || sdkNorm === 'sdk';
+    // Salutations type sdk : toujours en local même si historique long (évite l'IA qui rajoute "et toi ça dit quoi")
+    if (isPureSdkOrWhatsUpLine(t) || (!skipShort && (isSdkOnly || (sdkNorm.length <= 28 && (sdkNorm === 'sdk' || sdkNorm.startsWith('sdk ')))))) {
+        return pickSdkWhatsUpReply();
+    }
+
+    if (t.includes('tu sert a quoi') || t.includes('tu sers a quoi') || t.includes('tu fais quoi')) {
+        return `Man je suis là pour ça\n` +
+               `Les liens TikTok YouTube Facebook Instagram je récupère la vidéo\n` +
+               `Commandes -sticker -image -video -find -gimage\n` +
+               `-menu si tu veux tout voir d'un coup bro`;
+    }
+
+    if (!skipShort && isShortCasualGreeting(t)) {
+        return pickCasualGreetingReply();
     }
 
     if (t.includes('quel année') || t.includes('quelle année')) {
-        return `Nous sommes en ${new Date().getFullYear()} 📅`;
+        return `On est en ${new Date().getFullYear()} man t'as dormi où mdrr`;
     }
 
     return null;
 }
+
+/** Blagues : tirage aléatoire uniforme (`-joke` partout). */
+const BOT_JOKES = [
+    "Pourquoi les plongeurs plongent-ils toujours en arrière ? Parce que sinon ils tombent dans le bateau ! 😄",
+    "Qu'est-ce qui est jaune et qui attend ? Jonathan ! 🟡",
+    "Pourquoi les oiseaux volent-ils vers le sud en hiver ? Parce que c'est trop loin à pied ! 🐦",
+    "🇬🇦 *Blague gabonaise :* Pourquoi le Gabonais ne va jamais au restaurant ? Parce qu'il préfère manger à la maison avec sa maman ! 😄",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit à son ami : 'Mon frère, j'ai acheté une voiture !' L'ami répond : 'C'est bien ! Elle marche ?' 'Non, elle ne marche pas, elle roule !' 🚗",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais sont-ils toujours en retard ? Parce qu'ils arrivent toujours à l'heure gabonaise ! ⏰",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le médecin : 'Docteur, j'ai mal partout !' 'Partout ?' 'Oui, partout où je me touche !' 🏥",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais d'ascenseur ? Parce qu'ils préfèrent monter à pied ! 🏢",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai économisé 1000 francs !' 'C'est bien !' 'Oui, maintenant je peux acheter un billet de 1000 francs !' 💰",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne jouent jamais aux échecs ? Parce qu'ils préfèrent jouer aux dames ! ♟️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va au marché : 'Combien coûte ce poisson ?' '1000 francs !' 'Et si je prends deux ?' 'Alors c'est 2000 francs !' 🐟",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais froid ? Parce qu'ils ont toujours chaud ! 🌡️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mon téléphone !' 'Où l'as-tu perdu ?' 'Je ne sais pas, il ne répond plus !' 📱",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de parapluie ? Parce qu'ils préfèrent attendre que la pluie s'arrête ! ☔",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le coiffeur : 'Je veux une coupe moderne !' 'D'accord !' 'Mais pas trop moderne !' 💇‍♂️",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de régime ? Parce qu'ils préfèrent grossir ! 🍽️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté un ordinateur !' 'C'est bien !' 'Oui, maintenant je peux jouer aux jeux !' 💻",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais soif ? Parce qu'ils boivent toujours de l'eau ! 💧",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va au cinéma : 'Combien coûte un ticket ?' '500 francs !' 'Et pour deux ?' '1000 francs !' 🎬",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de sport ? Parce qu'ils préfèrent regarder les autres ! 🏃‍♂️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mes clés !' 'Où les as-tu perdues ?' 'Je ne sais pas, elles ne répondent plus !' 🔑",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de réveil ? Parce qu'ils se réveillent toujours à l'heure ! ⏰",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le dentiste : 'J'ai mal aux dents !' 'Quelle dent ?' 'Toutes !' 🦷",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de bricolage ? Parce qu'ils préfèrent appeler quelqu'un ! 🔨",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté une maison !' 'C'est bien !' 'Oui, maintenant je peux y habiter !' 🏠",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais faim ? Parce qu'ils mangent toujours ! 🍽️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le médecin : 'Docteur, j'ai mal à la tête !' 'Prenez un comprimé !' 'Quel comprimé ?' 'Celui que je vous donne !' 💊",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de ménage ? Parce qu'ils préfèrent que quelqu'un d'autre le fasse ! 🧹",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mon portefeuille !' 'Où l'as-tu perdu ?' 'Je ne sais pas, il ne répond plus !' 💼",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de GPS ? Parce qu'ils connaissent toujours le chemin ! 🗺️",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais va au restaurant : 'Je veux manger !' 'Qu'est-ce que vous voulez ?' 'Ce que vous avez !' 🍽️",
+    "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de sport ? Parce qu'ils préfèrent regarder la télé ! 📺",
+    "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté un téléphone !' 'C'est bien !' 'Oui, maintenant je peux appeler !' 📞",
+    "💻 *Blague tech :* Pourquoi les programmeurs confondent-ils Halloween et Noël ? Parce que 31 OCT = 25 DEC ! 🎃"
+];
+
+/** Citations / proverbes : tirage aléatoire (`-quote`), entrées uniques (sans répétitions Steve Jobs). */
+const BOT_QUOTES = [
+    "🌟 *Citation inspirante :* 'Le succès, c'est tomber sept fois et se relever huit.' - Proverbe japonais",
+    "💡 *Citation de Steve Jobs :* 'L'innovation distingue un leader d'un suiveur.'",
+    "💻 *Citation tech :* 'Le code est comme l'humour. Quand on doit l'expliquer, c'est mauvais.' - Cory House",
+    "❤️ *Citation de Steve Jobs :* 'La seule façon de faire du bon travail, c'est d'aimer ce que vous faites.'",
+    "🚀 *Citation de Steve Jobs :* 'Soyez insatiables. Soyez fous.'",
+    "🎯 *Citation de Steve Jobs :* 'Votre temps est limité, ne le gaspillez pas en vivant la vie de quelqu'un d'autre.'",
+    "🌟 *Citation de Steve Jobs :* 'La simplicité est la sophistication suprême.'",
+    "🎨 *Citation de Steve Jobs :* 'Le design n'est pas seulement à quoi ça ressemble et à quoi ça donne l'impression. Le design, c'est comment ça fonctionne.'",
+    "💪 *Citation de Steve Jobs :* 'Restez affamés. Restez fous.'",
+    "🎯 *Citation de Steve Jobs :* 'Les gens ne savent pas ce qu'ils veulent jusqu'à ce que vous le leur montriez.'",
+    "🌟 *Citation de Steve Jobs :* 'La qualité est plus importante que la quantité.'",
+    "🔧 *Citation tech :* 'Il n'y a que deux types de langages de programmation : ceux dont les gens se plaignent et ceux que personne n'utilise.' - Bjarne Stroustrup",
+    "🎯 *Citation tech :* 'Premièrement, résolvez le problème. Puis, écrivez le code.' - John Johnson",
+    "✨ *Citation inspirante :* 'La perfection est atteinte, non pas lorsqu'il n'y a plus rien à ajouter, mais lorsqu'il n'y a plus rien à retirer.' - Antoine de Saint-Exupéry",
+    "🎓 *Citation inspirante :* 'Un expert est une personne qui a commis toutes les erreurs possibles dans un domaine très restreint.' - Niels Bohr",
+    "📚 *Citation inspirante :* 'L'expérience est le nom que chacun donne à ses erreurs.' - Oscar Wilde",
+    "🚀 *Citation inspirante :* 'Dans 20 ans, vous serez plus déçu par les choses que vous n'avez pas faites que par celles que vous avez faites.' - Mark Twain"
+];
 
 function getProfileJidCandidates(targetJid) {
     const candidates = [];
@@ -440,6 +1227,79 @@ async function processProfilePictureCommand(sock, msg, jid) {
         console.error('❌ Erreur commande pp:', error.message);
         await sock.sendMessage(jid, {
             text: '😅 Impossible de récupérer la photo de profil pour le moment.'
+        });
+    }
+}
+
+async function processStatusCommand(sock, msg, jid) {
+    try {
+        const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        const requesterJid = msg.key.participant || msg.key.remoteJid;
+
+        if (!quotedMsg) {
+            await sock.sendMessage(jid, {
+                text: '💡 Réponds à un statut (photo/vidéo) avec `-status`.'
+            });
+            return;
+        }
+
+        let mediaMsg = null;
+        let mediaType = null;
+
+        if (quotedMsg.imageMessage) {
+            mediaMsg = quotedMsg.imageMessage;
+            mediaType = 'image';
+        } else if (quotedMsg.videoMessage) {
+            mediaMsg = quotedMsg.videoMessage;
+            mediaType = 'video';
+        } else if (quotedMsg.viewOnceMessage?.message?.imageMessage) {
+            mediaMsg = quotedMsg.viewOnceMessage.message.imageMessage;
+            mediaType = 'image';
+        } else if (quotedMsg.viewOnceMessage?.message?.videoMessage) {
+            mediaMsg = quotedMsg.viewOnceMessage.message.videoMessage;
+            mediaType = 'video';
+        } else if (quotedMsg.viewOnceMessageV2?.message?.imageMessage) {
+            mediaMsg = quotedMsg.viewOnceMessageV2.message.imageMessage;
+            mediaType = 'image';
+        } else if (quotedMsg.viewOnceMessageV2?.message?.videoMessage) {
+            mediaMsg = quotedMsg.viewOnceMessageV2.message.videoMessage;
+            mediaType = 'video';
+        }
+
+        if (!mediaMsg || !mediaType) {
+            await sock.sendMessage(jid, {
+                text: '😅 Ce statut ne contient pas une image/vidéo récupérable.'
+            });
+            return;
+        }
+
+        const stream = await downloadContentFromMessage(mediaMsg, mediaType);
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const mediaBuffer = Buffer.concat(chunks);
+
+        if (!mediaBuffer || mediaBuffer.length === 0) {
+            await sock.sendMessage(jid, {
+                text: '😅 Impossible de télécharger ce statut.'
+            });
+            return;
+        }
+
+        if (mediaType === 'image') {
+            await sock.sendMessage(requesterJid, {
+                image: mediaBuffer,
+                caption: '📥 Statut photo récupéré.'
+            });
+        } else {
+            await sock.sendMessage(requesterJid, {
+                video: mediaBuffer,
+                caption: '📥 Statut vidéo récupéré.'
+            });
+        }
+    } catch (error) {
+        console.error('❌ Erreur commande status:', error.message);
+        await sock.sendMessage(jid, {
+            text: '😅 Oups, je n’ai pas pu récupérer ce statut.'
         });
     }
 }
@@ -748,6 +1608,10 @@ async function processCriticalCommand(sock, msg, command, fullCommand, jid, isGr
                     });
                 }
                 break;
+
+            case 'status':
+                await processStatusCommand(sock, msg, jid);
+                break;
                 
             case 'creator':
                 await sock.sendMessage(jid, {
@@ -760,29 +1624,21 @@ async function processCriticalCommand(sock, msg, command, fullCommand, jid, isGr
                 });
                 break;
                 
-            case 'joke':
-                const jokes = [
-                    "Pourquoi les plongeurs plongent-ils toujours en arrière ? Parce que sinon ils tombent dans le bateau ! 😄",
-                    "Qu'est-ce qui est jaune et qui attend ? Jonathan ! 🟡",
-                    "Pourquoi les oiseaux volent-ils vers le sud en hiver ? Parce que c'est trop loin à pied ! 🐦"
-                ];
-                const randomJoke = jokes[Math.floor(Math.random() * jokes.length)];
+            case 'joke': {
+                const randomJoke = BOT_JOKES[Math.floor(Math.random() * BOT_JOKES.length)];
                 await sock.sendMessage(jid, {
-                    text: `😂 *BLAGUE DU JOUR* 😂\n\n${randomJoke}\n\n🤣 J'espère que ça t'a fait rire !`
+                    text: `😂 *BLAGUE DU JOUR* 😂\n\n${randomJoke}\n\n🤣 J'espère que ça t'a fait rire ! Tape \`-joke\` pour une autre blague !`
                 });
                 break;
+            }
                 
-            case 'quote':
-                const quotes = [
-                    "Le succès, c'est tomber sept fois et se relever huit. - Proverbe japonais 🌅",
-                    "L'innovation distingue un leader d'un suiveur. - Steve Jobs 💡",
-                    "Le code est comme l'humour. Quand on doit l'expliquer, c'est mauvais. - Cory House 💻"
-                ];
-                const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
+            case 'quote': {
+                const randomQuote = BOT_QUOTES[Math.floor(Math.random() * BOT_QUOTES.length)];
                 await sock.sendMessage(jid, {
-                    text: `✨ *CITATION INSPIRANTE* ✨\n\n_${randomQuote}_\n\n💭 Réfléchis-y !`
+                    text: `✨ *CITATION INSPIRANTE* ✨\n\n_${randomQuote}_\n\n💭 Réfléchis-y ! Tape \`-quote\` pour une autre citation !`
                 });
                 break;
+            }
                 
             case 'fact':
                 const facts = [
@@ -910,7 +1766,7 @@ async function processAudioMessage(sock, jid, msg) {
             }
             
             console.log('🎵 Prompt contextuel:', contextualPrompt.substring(0, 100) + '...');
-            const response = await askGeminiWithFallback(contextualPrompt);
+            const response = await askGeminiWithFallback(contextualPrompt, { jid, recordHistory: true });
             console.log('🎵 Réponse IA obtenue:', response.substring(0, 100) + '...');
             
             await sock.sendMessage(jid, {
@@ -1130,11 +1986,8 @@ async function downloadYouTubeVideo(url, outputPath, sock, jid) {
                 return null;
             }
             
-            // Envoyer la vidéo
-            const shortIndicator = isShort ? '🎬 *YouTube Short*' : '🎬 *Vidéo YouTube*';
             await sock.sendMessage(jid, {
-                video: fs.readFileSync(outputPath),
-                caption: `${shortIndicator} *téléchargée* (téléchargement direct)\n\n📺 *Titre:* ${title}\n⏱️ *Durée:* ${Math.floor(duration/60)}:${(duration%60).toString().padStart(2, '0')}\n📊 *Qualité:* ${videoFormat.qualityLabel || 'HD'}\n\n🔗 *Source:* ${url}`
+                video: fs.readFileSync(outputPath)
             });
             
             // Nettoyer le fichier temporaire
@@ -1183,10 +2036,8 @@ async function downloadFacebookVideo(url, outputPath, sock, jid) {
                 
                 console.log('✅ Vidéo Facebook téléchargée via fb-downloader-scrapper:', outputPath);
                 
-                // Envoyer la vidéo
                 await sock.sendMessage(jid, {
-                    video: fs.readFileSync(outputPath),
-                    caption: `📘 *Vidéo Facebook téléchargée* (via fb-downloader-scrapper)\n\n📺 *Titre:* ${result.title || 'Vidéo Facebook'}\n⏱️ *Durée:* ${result.duration || 'Inconnue'}\n\n🔗 *Source:* ${url}`
+                    video: fs.readFileSync(outputPath)
                 });
                 
                 // Nettoyer le fichier temporaire
@@ -1272,10 +2123,8 @@ async function downloadFacebookVideo(url, outputPath, sock, jid) {
                 
                 console.log('✅ Vidéo Facebook téléchargée via Puppeteer:', outputPath);
                 
-                // Envoyer la vidéo
                 await sock.sendMessage(jid, {
-                    video: fs.readFileSync(outputPath),
-                    caption: `📘 *Vidéo Facebook téléchargée* (via Puppeteer)\n\n📺 *Titre:* ${videoData.title}\n⏱️ *Durée:* ${videoData.duration}\n\n🔗 *Source:* ${url}`
+                    video: fs.readFileSync(outputPath)
                 });
                 
                 // Nettoyer le fichier temporaire
@@ -1381,10 +2230,8 @@ async function downloadFacebookVideo(url, outputPath, sock, jid) {
                     
                     console.log('✅ Vidéo Facebook téléchargée via scraping:', outputPath);
                     
-                    // Envoyer la vidéo
                     await sock.sendMessage(jid, {
-                        video: fs.readFileSync(outputPath),
-                        caption: `📘 *Vidéo Facebook téléchargée* (via scraping)\n\n📺 *Titre:* Vidéo Facebook\n⏱️ *Durée:* Inconnue\n\n🔗 *Source:* ${url}`
+                        video: fs.readFileSync(outputPath)
                     });
                     
                     // Nettoyer le fichier temporaire
@@ -1443,10 +2290,8 @@ async function downloadFacebookVideo(url, outputPath, sock, jid) {
             
             console.log('✅ Vidéo Facebook téléchargée:', outputPath);
             
-            // Envoyer la vidéo
             await sock.sendMessage(jid, {
-                video: fs.readFileSync(outputPath),
-                caption: `📘 *Vidéo Facebook téléchargée*\n\n📺 *Titre:* ${title}\n⏱️ *Durée:* ${duration}\n\n🔗 *Source:* ${url}`
+                video: fs.readFileSync(outputPath)
             });
             
             // Nettoyer le fichier temporaire
@@ -1551,12 +2396,7 @@ async function downloadInstagramVideo(url, outputPath, sock, jid) {
                             console.log('✅ Vidéo Instagram téléchargée avec youtube-dl:', outputPath);
                             
                             await sock.sendMessage(jid, {
-                                text: `📷 *Vidéo Instagram téléchargée !*\n\n` +
-                                      `📝 *Titre :* ${videoInfo.title || 'Instagram Video'}\n` +
-                                      `👤 *Auteur :* ${videoInfo.uploader || 'Inconnu'}\n` +
-                                      `⏱️ *Durée :* ${videoInfo.duration ? Math.floor(videoInfo.duration/60) + ':' + (videoInfo.duration%60).toString().padStart(2, '0') : 'Inconnue'}\n` +
-                                      `📁 *Fichier :* ${path.basename(outputPath)}\n\n` +
-                                      `🎉 *Téléchargement réussi avec youtube-dl !*`
+                                video: fs.readFileSync(outputPath)
                             });
                             
                             resolve(true);
@@ -1598,7 +2438,6 @@ async function downloadInstagramVideo(url, outputPath, sock, jid) {
                 
                 if (response.data && (response.data.video_url || response.data.url)) {
                     const videoUrl = response.data.video_url || response.data.url;
-                    const title = response.data.title || response.data.description || 'Instagram Video';
                     
                     console.log('✅ URL vidéo trouvée via API alternative:', videoUrl);
                     
@@ -1620,10 +2459,7 @@ async function downloadInstagramVideo(url, outputPath, sock, jid) {
                             console.log('✅ Vidéo Instagram téléchargée via API alternative:', outputPath);
                             
                             await sock.sendMessage(jid, {
-                                text: `📷 *Vidéo Instagram téléchargée !*\n\n` +
-                                      `📝 *Titre :* ${title}\n` +
-                                      `📁 *Fichier :* ${path.basename(outputPath)}\n\n` +
-                                      `🎉 *Téléchargement réussi via API alternative !*`
+                                video: fs.readFileSync(outputPath)
                             });
                             
                             resolve(true);
@@ -1757,10 +2593,7 @@ async function downloadInstagramVideo(url, outputPath, sock, jid) {
                         console.log('✅ Vidéo Instagram téléchargée via scraping:', outputPath);
                         
                         await sock.sendMessage(jid, {
-                            text: `📷 *Vidéo Instagram téléchargée !*\n\n` +
-                                  `📝 *Titre :* Instagram Video\n` +
-                                  `📁 *Fichier :* ${path.basename(outputPath)}\n\n` +
-                                  `🎉 *Téléchargement réussi via scraping !*`
+                            video: fs.readFileSync(outputPath)
                         });
                         
                         resolve(true);
@@ -1848,10 +2681,8 @@ async function downloadTikTokVideo(url, outputPath, sock, jid) {
             
             console.log('✅ Vidéo TikTok téléchargée:', outputPath);
             
-            // Envoyer la vidéo
             await sock.sendMessage(jid, {
-                video: fs.readFileSync(outputPath),
-                caption: `🎵 *Vidéo TikTok téléchargée*\n\n📺 *Titre:* ${data.data.title || 'Vidéo TikTok'}\n👤 *Auteur:* ${data.data.author?.nickname || 'Inconnu'}\n⏱️ *Durée:* ${data.data.duration || 'Inconnue'}\n\n🔗 *Source:* ${url}`
+                video: fs.readFileSync(outputPath)
             });
             
             // Nettoyer le fichier temporaire
@@ -1899,7 +2730,6 @@ async function downloadPinterestVideo(url, outputPath, sock, jid) {
                 
                 if (response.data && response.data.video_url) {
                     const videoUrl = response.data.video_url;
-                    const title = response.data.title || 'Pinterest Video';
                     
                     console.log('✅ URL vidéo Pinterest trouvée:', videoUrl);
                     
@@ -1917,10 +2747,7 @@ async function downloadPinterestVideo(url, outputPath, sock, jid) {
                             console.log('✅ Vidéo Pinterest téléchargée:', outputPath);
                             
                             await sock.sendMessage(jid, {
-                                text: `📌 *Vidéo Pinterest téléchargée !*\n\n` +
-                                      `📝 *Titre :* ${title}\n` +
-                                      `📁 *Fichier :* ${path.basename(outputPath)}\n\n` +
-                                      `🎉 *Téléchargement réussi !*`
+                                video: fs.readFileSync(outputPath)
                             });
                             
                             resolve(true);
@@ -1975,10 +2802,7 @@ async function downloadPinterestVideo(url, outputPath, sock, jid) {
                             console.log('✅ Vidéo Pinterest téléchargée via scraping:', outputPath);
                             
                             await sock.sendMessage(jid, {
-                                text: `📌 *Vidéo Pinterest téléchargée !*\n\n` +
-                                      `📝 *Titre :* Pinterest Video\n` +
-                                      `📁 *Fichier :* ${path.basename(outputPath)}\n\n` +
-                                      `🎉 *Téléchargement réussi !*`
+                                video: fs.readFileSync(outputPath)
                             });
                             
                             resolve(true);
@@ -2031,10 +2855,8 @@ async function downloadGenericVideo(url, outputPath, sock, jid) {
         
         console.log('✅ Vidéo générique téléchargée:', outputPath);
         
-        // Envoyer la vidéo
         await sock.sendMessage(jid, {
-            video: fs.readFileSync(outputPath),
-            caption: `🎬 *Vidéo téléchargée*\n\n🔗 *Source:* ${url}`
+            video: fs.readFileSync(outputPath)
         });
         
         // Nettoyer le fichier temporaire
@@ -2514,18 +3336,7 @@ function detectGreeting(message) {
  * Génère une réponse de salutation personnalisée
  */
 function generateGreetingResponse() {
-    const greetings = [
-        "Salut ! 😊 Comment puis-je t'aider aujourd'hui ?",
-        "Hey ! 👋 Ravi de te voir ! Que puis-je faire pour toi ?",
-        "Coucou ! 😄 Je suis là pour t'aider ! Que veux-tu savoir ?",
-        "Bonjour ! ✨ Comment puis-je t'assister ?",
-        "Yo ! 🤗 Qu'est-ce que je peux faire pour toi ?",
-        "Hello ! 😊 Je suis prêt à répondre à tes questions !",
-        "Salut l'ami ! 🤗 Que puis-je faire pour toi aujourd'hui ?",
-        "Coucou ! 😄 Je suis là pour t'aider ! Que veux-tu savoir ?"
-    ];
-    
-    return greetings[Math.floor(Math.random() * greetings.length)];
+    return pickCasualGreetingReply();
 }
 
 /**
@@ -2691,10 +3502,7 @@ async function showMenu(sock, jid) {
 ╔══════════════════════════════════════╗
 ║  💡 *ASTUCE* : Tape \`-menu\` à tout  ║
 ║     moment pour revoir ce menu !     ║
-╚══════════════════════════════════════╝
-
-🚀 *Propulsé par Gemini AI + Fallback JSON*
-⚡ *Interface Web disponible sur le port 3001*`;
+╚══════════════════════════════════════╝`;
 
     // Envoyer la vidéo avec le menu en caption (reconnectés)
     await sock.sendMessage(jid, {
@@ -2871,45 +3679,484 @@ async function downloadYouTube(url) {
     }
 }
 
+const FIND_GOOGLE_EXTRA_PARAMS = { hl: 'fr', gl: 'fr' };
+const FIND_GOOGLE_AXIOS = { timeout: 35000, maxRedirects: 5 };
+const FIND_PUPPETEER_WAIT_MS = 3200;
+const FIND_SERP_USER_AGENT =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+function stripHtmlCollapse(s) {
+    if (!s) return '';
+    return String(s)
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 /**
- * Recherche sur Google
+ * Quand googlethis ne remplit plus results (Google change le HTML), on extrait les liens /url?q=…
  */
-async function searchGoogle(query) {
-    try {
-        const google = require('googlethis');
-        const results = await google.search(query, { page: 0 });
-        
-        if (results.results && results.results.length > 0) {
-            const firstResult = results.results[0];
-            return `🔍 *Résultat de recherche pour "${query}"*\n\n` +
-                   `*${firstResult.title}*\n` +
-                   `${firstResult.description}\n\n` +
-                   `🔗 ${firstResult.url}`;
+function extractGoogleSerpLooseResults(html, max = 8) {
+    if (!html || typeof html !== 'string' || html.length < 400) return [];
+    const cheerio = require('cheerio');
+    const $ = cheerio.load(html);
+    const out = [];
+    const seen = new Set();
+
+    $('a[href]').each((_, el) => {
+        if (out.length >= max) return false;
+        let href = $(el).attr('href') || '';
+        if (!href.includes('/url?q=')) return;
+        if (!href.startsWith('http')) href = 'https://www.google.com' + (href.startsWith('/') ? href : `/${href}`);
+        let target = null;
+        try {
+            const u = new URL(href);
+            target = u.searchParams.get('q');
+        } catch (_) {
+            return;
         }
-        
-        return 'Aucun résultat trouvé pour cette recherche.';
-    } catch (error) {
-        console.error('Erreur recherche Google:', error.message);
-        return 'Erreur lors de la recherche.';
+        if (!target || !/^https?:\/\//i.test(target)) return;
+        if (/google\.com\/search/i.test(target)) return;
+        if (seen.has(target)) return;
+        const title = ($(el).find('h3').first().text() || '').trim();
+        const fallbackTitle = $(el)
+            .clone()
+            .children()
+            .remove()
+            .end()
+            .text()
+            .trim()
+            .replace(/\s+/g, ' ');
+        const t = title || fallbackTitle || target.replace(/^https?:\/\//i, '').slice(0, 80);
+        if (t.length < 2) return;
+        seen.add(target);
+        out.push({ title: t, url: target, description: '' });
+    });
+    return out;
+}
+
+function buildFindReplyFromLooseResults(query, items) {
+    if (!items || !items.length) return '';
+    const lines = [`🔍 *Recherche :* ${query}`, ''];
+    items.forEach((r, i) => {
+        lines.push(`${i + 1}) *${stripHtmlCollapse(r.title)}*`);
+        if (r.description) lines.push(stripHtmlCollapse(r.description));
+        lines.push(`🔗 ${r.url}`);
+        lines.push('');
+    });
+    return lines.join('\n').trim().slice(0, 6500);
+}
+
+/**
+ * Extrait un bloc type « aperçu / IA » du HTML brut (souvent chargé en JS — meilleure chance avec Puppeteer).
+ */
+function extractGoogleAiStyleOverviewText(html) {
+    if (!html || typeof html !== 'string') return '';
+    const cheerio = require('cheerio');
+    const $ = cheerio.load(html);
+    const chunks = [];
+
+    $('div.Y3BBE, div.wDYxhc, div.LLNLxf span, div[data-snf="nke7rc"], div[class*="LGOjhe"]').each((_i, el) => {
+        const t = $(el).text().replace(/\s+/g, ' ').trim();
+        if (t.length > 35 && !/^[\d\s+−]+$/.test(t)) chunks.push(t);
+    });
+
+    const seen = new Set();
+    const uniq = [];
+    for (const c of chunks) {
+        const key = c.slice(0, 120);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        uniq.push(c);
+    }
+    const text = uniq.join('\n\n').trim();
+    return text.length > 80 ? text.slice(0, 4200) : '';
+}
+
+function parseGoogleSerpWithGooglethis(html, isMobile) {
+    const cheerio = require('cheerio');
+    const Utils = require('googlethis/lib/utils/utils');
+    const OrganicResults = require('googlethis/lib/core/nodes/OrganicResults');
+    const FeaturedSnippet = require('googlethis/lib/core/nodes/FeaturedSnippet');
+    const KnowledgeGraph = require('googlethis/lib/core/nodes/KnowledgeGraph');
+    const PAA = require('googlethis/lib/core/nodes/PAA');
+
+    const refined = Utils.refineData(html, false, isMobile);
+    const $ = cheerio.load(refined);
+    return {
+        results: OrganicResults.parse($, false, isMobile),
+        knowledge_panel: new KnowledgeGraph(html, $),
+        featured_snippet: new FeaturedSnippet($),
+        people_also_ask: PAA.parse($, html)
+    };
+}
+
+async function executeGoogleThisSearch(query) {
+    const google = require('googlethis');
+    let lastErr;
+    for (const useMobile of [true, false]) {
+        try {
+            return await google.search(query, {
+                page: 0,
+                use_mobile_ua: useMobile,
+                additional_params: FIND_GOOGLE_EXTRA_PARAMS,
+                axios_config: FIND_GOOGLE_AXIOS
+            });
+        } catch (e) {
+            lastErr = e;
+            console.error('Erreur recherche Google:', useMobile ? 'mobile' : 'desktop', e.message);
+        }
+    }
+    throw lastErr || new Error('Google search failed');
+}
+
+async function fetchGoogleSerpHtmlAxios(query, useGbv = false) {
+    const gbv = useGbv ? '&gbv=1' : '';
+    const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=fr&gl=fr&ie=UTF-8${gbv}`;
+    const res = await axios.get(url, {
+        timeout: 35000,
+        maxRedirects: 5,
+        responseType: 'text',
+        validateStatus: (s) => s >= 200 && s < 400,
+        headers: {
+            'User-Agent': FIND_SERP_USER_AGENT,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.7',
+            Referer: 'https://www.google.com/'
+        }
+    });
+    return typeof res.data === 'string' ? res.data : String(res.data || '');
+}
+
+async function fetchGoogleSerpHtmlPuppeteer(query) {
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        });
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1365, height: 900 });
+        await page.setUserAgent(FIND_SERP_USER_AGENT);
+        const url =
+            `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=fr&gl=fr&ie=UTF-8`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 42000 });
+        await new Promise(r => setTimeout(r, FIND_PUPPETEER_WAIT_MS));
+        return await page.content();
+    } finally {
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (_) { /* noop */ }
+        }
+    }
+}
+
+function formatGoogleSearchReply(parsed, query, rawHtmlForAiExtract) {
+    const lines = [];
+    lines.push(`🔍 *Recherche :* ${query}`);
+
+    const aiBlock = rawHtmlForAiExtract ? extractGoogleAiStyleOverviewText(rawHtmlForAiExtract) : '';
+    if (aiBlock) {
+        lines.push('');
+        lines.push('🤖 *Aperçu (synthèse en tête de page)*');
+        lines.push(aiBlock);
+    }
+
+    const fs = parsed.featured_snippet;
+    const kp = parsed.knowledge_panel;
+
+    if (fs && (fs.description || fs.title)) {
+        lines.push('');
+        lines.push('⭐ *Encart « réponse rapide »*');
+        if (fs.title) lines.push(`*${stripHtmlCollapse(fs.title)}*`);
+        if (fs.description) lines.push(stripHtmlCollapse(fs.description));
+        if (fs.url) lines.push(`🔗 ${fs.url}`);
+    } else if (kp && (kp.description || kp.title)) {
+        lines.push('');
+        lines.push('📌 *Fiche / panneau latéral*');
+        if (kp.title) lines.push(`*${stripHtmlCollapse(kp.title)}*`);
+        if (kp.type) lines.push(`_${stripHtmlCollapse(kp.type)}_`);
+        if (kp.description) lines.push(stripHtmlCollapse(kp.description));
+        if (kp.url) lines.push(`🔗 ${kp.url}`);
+    }
+
+    const organicList = Array.isArray(parsed.results) ? parsed.results : [];
+    const organicsToShow = organicList.filter((o) => o && (o.title || o.url)).slice(0, 6);
+    if (organicsToShow.length) {
+        lines.push('');
+        lines.push(organicsToShow.length > 1 ? '🔎 *Résultats web*' : '🔎 *Premier résultat web*');
+        organicsToShow.forEach((o, idx) => {
+            if (organicsToShow.length > 1) lines.push(`*${idx + 1}.*`);
+            if (o.title) lines.push(`*${stripHtmlCollapse(o.title)}*`);
+            if (o.description) lines.push(stripHtmlCollapse(o.description));
+            if (o.url) lines.push(`🔗 ${o.url}`);
+            if (idx < organicsToShow.length - 1) lines.push('');
+        });
+    }
+
+    const paa = parsed.people_also_ask;
+    if (Array.isArray(paa) && paa.length > 1) {
+        const qs = paa.filter(Boolean).slice(0, 4);
+        if (qs.length) {
+            lines.push('');
+            lines.push('❓ *Questions associées*');
+            qs.forEach((q) => lines.push(`• ${stripHtmlCollapse(q)}`));
+        }
+    }
+
+    if (lines.length <= 1) return '';
+
+    return lines.join('\n').slice(0, 6500);
+}
+
+async function searchGoogleAiSynthFallback(query) {
+    try {
+        const prompt =
+            `Recherche web simulée pour la requête : « ${query} ».\n` +
+            `Rédige en français une courte synthèse du type « aperçu en haut de Google » : 5 à 10 phrases maximum, claires, utiles, sans markdown lourd, sans liste longue. ` +
+            `Si tu manques d'infos fiables, dis-le en une phrase.`;
+        const text = await askGeminiWithFallback(prompt);
+        if (!text || !String(text).trim()) return null;
+        return (
+            `🔍 *Recherche :* ${query}\n\n` +
+            `🤖 *Synthèse (IA — Google indisponible ou page non lisible)*\n\n` +
+            String(text).trim().slice(0, 5500)
+        );
+    } catch (_) {
+        return null;
     }
 }
 
 /**
- * Recherche d'images Google
+ * Recherche sur Google : priorité à l’aperçu du haut (encart / IA quand présent dans le HTML), puis repli navigateur, puis IA.
  */
-async function searchGoogleImages(query) {
+function enrichFindReplyFromHtml(query, html) {
+    if (!html) return '';
+    let msg = '';
+    const desktopParsed = parseGoogleSerpWithGooglethis(html, false);
+    msg = formatGoogleSearchReply(desktopParsed, query, html);
+    if (msg?.trim()) return msg;
+    const mobileParsed = parseGoogleSerpWithGooglethis(html, true);
+    msg = formatGoogleSearchReply(mobileParsed, query, html);
+    if (msg?.trim()) return msg;
+    const loose = extractGoogleSerpLooseResults(html);
+    return buildFindReplyFromLooseResults(query, loose);
+}
+
+async function searchGoogle(query) {
+    const q = String(query || '').trim();
+    if (!q) return 'Indique ce que tu veux chercher. Exemple : `-find mma`';
+
     try {
-        const google = require('googlethis');
-        const results = await google.image(query, { safe: false });
-        
-        if (results && results.length > 0) {
-            return results[0].url;
+        const results = await executeGoogleThisSearch(q);
+        const msg = formatGoogleSearchReply(results, q, null);
+        if (msg?.trim()) return msg;
+        if (results.results && results.results.length > 0) {
+            const o = results.results[0];
+            return (
+                `🔍 *Recherche :* ${q}\n\n` +
+                `🔎 *${stripHtmlCollapse(o.title)}*\n` +
+                `${stripHtmlCollapse(o.description)}\n\n` +
+                `🔗 ${o.url}`
+            );
         }
-        
+        // googlethis peut réussir avec 0 résultat parsé : continuer vers HTTP / Puppeteer / IA
+    } catch (err) {
+        console.error('Erreur recherche Google:', err.message);
+    }
+
+    try {
+        for (const useGbv of [false, true]) {
+            const htmlAxios = await fetchGoogleSerpHtmlAxios(q, useGbv);
+            if (htmlAxios && htmlAxios.length > 500) {
+                const fromHtml = enrichFindReplyFromHtml(q, htmlAxios);
+                if (fromHtml?.trim()) return fromHtml;
+            }
+        }
+    } catch (e) {
+        console.error('Recherche Google (HTTP):', e.message);
+    }
+
+    try {
+        const html = await fetchGoogleSerpHtmlPuppeteer(q);
+        if (html && html.length > 500) {
+            const fromHtml = enrichFindReplyFromHtml(q, html);
+            if (fromHtml?.trim()) return fromHtml;
+        }
+    } catch (e) {
+        console.error('Recherche Google (Puppeteer):', e.message);
+    }
+
+    const fallback = await searchGoogleAiSynthFallback(q);
+    if (fallback) return fallback;
+
+    return 'Erreur lors de la recherche Google. Réessaie plus tard ou reformule ta requête.';
+}
+
+const GIMAGE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const GIMAGE_MAX_PER_COMMAND = 4;
+const GIMAGE_DOWNLOAD_TIMEOUT_MS = 22000;
+const GIMAGE_MAX_BYTES = 12 * 1024 * 1024;
+/** Côté courte min. pour accepter une image « pleine taille » (évite les miniatures floues). */
+const GIMAGE_MIN_SHORT_SIDE_FULL = 400;
+/** Qualité JPEG sortie (évite l’aspect « paté » après recompression). */
+const GIMAGE_JPEG_QUALITY = 93;
+
+function shuffleArrayInPlace(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function normalizeGimageUrl(u) {
+    if (!u || typeof u !== 'string') return null;
+    let s = u.trim();
+    if (s.startsWith('//')) s = `https:${s}`;
+    if (!/^https?:\/\//i.test(s)) return null;
+    try {
+        return new URL(s).href;
+    } catch (_) {
         return null;
+    }
+}
+
+function isLikelyRawImageBuffer(buf) {
+    if (!buf || buf.length < 24) return false;
+    const b0 = buf[0];
+    const b1 = buf[1];
+    const b2 = buf[2];
+    const b3 = buf[3];
+    if (b0 === 0xFF && b1 === 0xD8 && b2 === 0xFF) return true;
+    if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4E && b3 === 0x47) return true;
+    if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46) return true;
+    if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46 && buf.toString('ascii', 8, 12) === 'WEBP') return true;
+    if (b0 === 0x3C || (b0 === 0xEF && b1 === 0xBB && b2 === 0xBF && buf[3] === 0x3C)) return false;
+    return false;
+}
+
+async function normalizeImageBufferForWhatsApp(buf) {
+    try {
+        return await sharp(buf, { failOn: 'none' }).rotate().jpeg({ quality: GIMAGE_JPEG_QUALITY, mozjpeg: true }).toBuffer();
+    } catch (_) {
+        return null;
+    }
+}
+
+async function imageBufferShortSide(buf) {
+    try {
+        const m = await sharp(buf, { failOn: 'none' }).metadata();
+        const w = m.width || 0;
+        const h = m.height || 0;
+        if (!w || !h) return 0;
+        return Math.min(w, h);
+    } catch (_) {
+        return 0;
+    }
+}
+
+async function downloadSingleGimageUrl(imageUrl, minShortSide = 0) {
+    const href = normalizeGimageUrl(imageUrl);
+    if (!href) return null;
+    let originReferer = 'https://www.google.com/';
+    try {
+        originReferer = new URL(href).origin + '/';
+    } catch (_) { /* noop */ }
+
+    for (const referer of ['https://www.google.com/', originReferer]) {
+        try {
+            const res = await axios.get(href, {
+                responseType: 'arraybuffer',
+                timeout: GIMAGE_DOWNLOAD_TIMEOUT_MS,
+                maxContentLength: GIMAGE_MAX_BYTES,
+                maxBodyLength: GIMAGE_MAX_BYTES,
+                validateStatus: (s) => s >= 200 && s < 400,
+                headers: {
+                    'User-Agent': GIMAGE_USER_AGENT,
+                    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                    'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.7',
+                    Referer: referer
+                }
+            });
+            const raw = Buffer.from(res.data);
+            if (raw.length < 200) continue;
+
+            let out = await normalizeImageBufferForWhatsApp(raw);
+            if (!out && isLikelyRawImageBuffer(raw)) out = raw;
+            if (!out || out.length < 200) continue;
+
+            if (minShortSide > 0) {
+                const side = await imageBufferShortSide(out);
+                if (side > 0 && side < minShortSide) continue;
+            }
+            return out;
+        } catch (_) {
+            // essai referer / URL suivante
+        }
+    }
+    return null;
+}
+
+/**
+ * URLs pleine résolution d’abord (mélangées), puis aperçus seulement pour combler les trous.
+ */
+async function collectGoogleImageCandidateUrls(query) {
+    const google = require('googlethis');
+    const results = await google.image(query, { safe: false });
+    if (!results || !results.length) return { full: [], preview: [] };
+
+    const seen = new Set();
+    const fullUrls = [];
+    const previewUrls = [];
+
+    for (const r of results) {
+        const full = normalizeGimageUrl(r.url);
+        const prev = normalizeGimageUrl(r.preview?.url);
+
+        if (full && !seen.has(full)) {
+            seen.add(full);
+            fullUrls.push(full);
+        }
+        if (prev && prev !== full && !seen.has(prev)) {
+            seen.add(prev);
+            previewUrls.push(prev);
+        }
+    }
+
+    shuffleArrayInPlace(fullUrls);
+    shuffleArrayInPlace(previewUrls);
+    return { full: fullUrls, preview: previewUrls };
+}
+
+/**
+ * Télécharge jusqu'à `maxCount` images exploitables pour WhatsApp (JPEG normalisé quand possible).
+ */
+async function fetchGimageBuffersForQuery(query, maxCount = GIMAGE_MAX_PER_COMMAND) {
+    try {
+        const { full, preview } = await collectGoogleImageCandidateUrls(query);
+        if (!full.length && !preview.length) return [];
+
+        const buffers = [];
+
+        for (const u of full) {
+            if (buffers.length >= maxCount) break;
+            const buf = await downloadSingleGimageUrl(u, GIMAGE_MIN_SHORT_SIDE_FULL);
+            if (buf) buffers.push(buf);
+        }
+
+        for (const u of preview) {
+            if (buffers.length >= maxCount) break;
+            const buf = await downloadSingleGimageUrl(u, 0);
+            if (buf) buffers.push(buf);
+        }
+
+        return buffers;
     } catch (error) {
         console.error('Erreur recherche images:', error.message);
-        return null;
+        return [];
     }
 }
 
@@ -2938,11 +4185,10 @@ async function showMenuImage(sock, jid) {
                         `• \`-img\` - Recherche inversée d'image\n` +
                         `• \`-transcrire\` - Transcription audio\n` +
                         `• \`-creator\` - Contact du créateur\n\n` +
-                        `*Interaction IA :*\n` +
-                        `• Envoyez un message texte pour une réponse IA\n` +
+                        `*Utilisation :*\n` +
+                        `• Envoyez un message texte pour une réponse\n` +
                         `• Envoyez une note vocale pour une réponse vocale\n` +
-                        `• Dans les groupes, mentionnez @AquilaBot\n\n` +
-                        `*Propulsé par Gemini AI avec système de fallback JSON*`
+                        `• Dans les groupes, mentionnez le bot si besoin.\n`
             });
         } else {
             await sock.sendMessage(jid, {
@@ -2966,7 +4212,7 @@ async function showMenuVideo(sock, jid) {
                 video: videoBuffer,
                 caption: `🤖 *JUXT_RTS BOT - MENU ANIMÉ*\n\n` +
                         `*Fonctionnalités :*\n` +
-                        `🧠 Intelligence Artificielle (Gemini + Fallback JSON)\n` +
+                        `🧠 Réponses aux questions (texte ou audio)\n` +
                         `🎵 Support audio (transcription + synthèse)\n` +
                         `🖼️ Conversion multimédia (stickers, images, vidéos)\n` +
                         `🌐 Recherche web (Google + Images)\n` +
@@ -3062,8 +4308,7 @@ async function startBot() {
                         await sock.sendMessage(CREATOR_CONTACT, {
                             text: '🤖 *Juxt_Rts Bot* est maintenant en ligne !\n\n' +
                                   `✅ Connexion établie avec succès\n` +
-                                  `🔧 Système de fallback JSON activé\n` +
-                                  `⚡ Prêt à répondre à vos questions !\n\n` +
+                                  `⚡ Prêt à recevoir tes commandes.\n\n` +
                                   `*Créateur:* ELLA ASSOUMOU Juste Renaric\n` +
                                   `*Contact:* +241076234942`
                         });
@@ -3081,11 +4326,12 @@ async function startBot() {
 
 // Gestion des messages
 sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        
-        if (!msg.message) return;
-        if (m.type !== 'notify') return;
-        if (msg.message.protocolMessage) return;
+        // notify = messages entrants ; append = souvent tes propres messages / sync (indispensable en groupe pour le même compte que le bot)
+        if (m.type !== 'notify' && m.type !== 'append') return;
+
+        const msg = pickMessageFromUpsert(m.messages, PREFIX);
+        if (!msg?.message) return;
+        if (msg.message.protocolMessage && Object.keys(msg.message).length === 1) return;
 
         const messageTimestamp = getMessageTimestampSeconds(msg);
         if (messageTimestamp && messageTimestamp < BOT_STARTUP_UNIX) {
@@ -3106,21 +4352,10 @@ sock.ev.on('messages.upsert', async (m) => {
             console.log('🔍 Contenu ephemeralMessage:', JSON.stringify(msg.message.ephemeralMessage, null, 2));
         }
         
-        const messageText = msg.message.conversation || 
-                          msg.message.extendedTextMessage?.text || 
-                          msg.message.ephemeralMessage?.message?.conversation ||
-                          msg.message.ephemeralMessage?.message?.extendedTextMessage?.text ||
-                          msg.message.imageMessage?.caption || 
-                          msg.message.videoMessage?.caption || 
-                          msg.message.audioMessage?.caption ||
-                          msg.message.protocolMessage?.conversation ||
-                          msg.message.protocolMessage?.extendedTextMessage?.text ||
-                          msg.message.viewOnceMessage?.message?.conversation ||
-                          msg.message.viewOnceMessage?.message?.extendedTextMessage?.text ||
-                          msg.message.viewOnceMessageV2?.message?.conversation ||
-                          msg.message.viewOnceMessageV2?.message?.extendedTextMessage?.text || '';
-        const isCommandFromText = (messageText || '').trim().startsWith(PREFIX);
-        const isVideoLinkMessage = !!(messageText || '').trim() && detectVideoLink(messageText);
+        const rawMessageText = extractRawMessageTextFromNode(msg);
+        const messageText = normalizeWhatsAppMessageText(rawMessageText);
+        const isCommandFromText = messageText.startsWith(PREFIX);
+        const isVideoLinkMessage = !!messageText && detectVideoLink(messageText);
         
         // En mode commandes uniquement, on laisse passer:
         // - les commandes préfixées
@@ -3140,6 +4375,10 @@ sock.ev.on('messages.upsert', async (m) => {
         if (jid === 'status@broadcast') {
             return;
         }
+
+        if (isJidNewsletter(jid)) {
+            return;
+        }
         
         // Ignorer les messages envoyés par le bot, sauf:
         // - commandes explicites
@@ -3149,6 +4388,8 @@ sock.ev.on('messages.upsert', async (m) => {
         // Anti-spam
         if (isMessageCached(messageId)) return;
         cacheMessage(messageId);
+
+        const chatThreadJid = await resolveChatThreadJid(sock, msg, jid);
         
         // Compter les messages pour les statistiques réelles
         const sender = msg.participant || msg.key.remoteJid;
@@ -3204,7 +4445,7 @@ sock.ev.on('messages.upsert', async (m) => {
             const command = fullCommand.split(' ')[0];
             
             // Commandes critiques qui ne doivent jamais être bloquées
-            const criticalCommands = ['send', 'sticker', 'image', 'video', 'creator', 'joke', 'quote', 'fact', 'time', 'steve', 'meditation'];
+            const criticalCommands = ['send', 'sticker', 'image', 'video', 'status', 'creator', 'joke', 'quote', 'fact', 'time', 'steve', 'meditation'];
             
             if (criticalCommands.includes(command)) {
                 console.log('🚨 Commande critique détectée:', command);
@@ -3275,8 +4516,8 @@ sock.ev.on('messages.upsert', async (m) => {
             return; // Ignorer le message
         }
 
-        // Répondre aux messages du bot
-        if (isQuotedBot) {
+        // Réponse au bot : ne pas court-circuiter les commandes (-menu en réponse à un message du bot, etc.)
+        if (isQuotedBot && !isCommand) {
             await sock.sendMessage(jid, {
                 text: '🤖 *Salut ! Je suis là pour t\'aider !*\n\n' +
                       '💡 *Que puis-je faire pour toi ?*\n' +
@@ -3423,6 +4664,10 @@ sock.ev.on('messages.upsert', async (m) => {
                 case 'pp':
                     await processProfilePictureCommand(sock, msg, jid);
                     break;
+
+                case 'status':
+                    await processStatusCommand(sock, msg, jid);
+                    break;
                     
                 case 'sticker':
                     // Vérifier s'il y a un message cité (réponse à une image/vidéo)
@@ -3537,17 +4782,13 @@ sock.ev.on('messages.upsert', async (m) => {
                     const stats = fallbackHandler.getStats();
                     await sock.sendMessage(jid, {
                         text: `🤖 *JUXT_RTS BOT - INFORMATIONS*\n\n` +
-                              `*Version:* 2.0 avec Fallback JSON\n` +
+                              `*Version:* 2.0\n` +
                               `*Créateur:* ELLA ASSOUMOU Juste Renaric\n` +
                               `*Contact:* +241076234942\n\n` +
-                              `*Statistiques Fallback:*\n` +
+                              `*Statistiques base locale :*\n` +
                               `📚 Catégories: ${stats.categories}\n` +
                               `📖 Sujets: ${stats.topics}\n` +
-                              `💬 Réponses: ${stats.responses}\n\n` +
-                              `*Statut:*\n` +
-                              `🧠 Gemini AI: ${genAI ? '✅ Actif' : '❌ Inactif'}\n` +
-                              `📋 Fallback JSON: ${fallbackHandler.isAvailable() ? '✅ Actif' : '❌ Inactif'}\n\n` +
-                              `*Propulsé par Gemini AI avec système de fallback intelligent*`
+                              `💬 Réponses: ${stats.responses}`
                     });
                     break;
                     
@@ -3567,90 +4808,21 @@ sock.ev.on('messages.upsert', async (m) => {
                     });
                     break;
                     
-                case 'joke':
-                    const jokes = [
-                        "🇬🇦 *Blague gabonaise :* Pourquoi le Gabonais ne va jamais au restaurant ? Parce qu'il préfère manger à la maison avec sa maman ! 😄",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit à son ami : 'Mon frère, j'ai acheté une voiture !' L'ami répond : 'C'est bien ! Elle marche ?' 'Non, elle ne marche pas, elle roule !' 🚗",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais sont-ils toujours en retard ? Parce qu'ils arrivent toujours à l'heure gabonaise ! ⏰",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le médecin : 'Docteur, j'ai mal partout !' 'Partout ?' 'Oui, partout où je me touche !' 🏥",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais d'ascenseur ? Parce qu'ils préfèrent monter à pied ! 🏢",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai économisé 1000 francs !' 'C'est bien !' 'Oui, maintenant je peux acheter un billet de 1000 francs !' 💰",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne jouent jamais aux échecs ? Parce qu'ils préfèrent jouer aux dames ! ♟️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va au marché : 'Combien coûte ce poisson ?' '1000 francs !' 'Et si je prends deux ?' 'Alors c'est 2000 francs !' 🐟",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais froid ? Parce qu'ils ont toujours chaud ! 🌡️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mon téléphone !' 'Où l'as-tu perdu ?' 'Je ne sais pas, il ne répond plus !' 📱",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de parapluie ? Parce qu'ils préfèrent attendre que la pluie s'arrête ! ☔",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le coiffeur : 'Je veux une coupe moderne !' 'D'accord !' 'Mais pas trop moderne !' 💇‍♂️",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de régime ? Parce qu'ils préfèrent grossir ! 🍽️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté un ordinateur !' 'C'est bien !' 'Oui, maintenant je peux jouer aux jeux !' 💻",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais soif ? Parce qu'ils boivent toujours de l'eau ! 💧",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va au cinéma : 'Combien coûte un ticket ?' '500 francs !' 'Et pour deux ?' '1000 francs !' 🎬",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de sport ? Parce qu'ils préfèrent regarder les autres ! 🏃‍♂️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mes clés !' 'Où les as-tu perdues ?' 'Je ne sais pas, elles ne répondent plus !' 🔑",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de réveil ? Parce qu'ils se réveillent toujours à l'heure ! ⏰",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le dentiste : 'J'ai mal aux dents !' 'Quelle dent ?' 'Toutes !' 🦷",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de bricolage ? Parce qu'ils préfèrent appeler quelqu'un ! 🔨",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté une maison !' 'C'est bien !' 'Oui, maintenant je peux y habiter !' 🏠",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'ont jamais faim ? Parce qu'ils mangent toujours ! 🍽️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va chez le médecin : 'Docteur, j'ai mal à la tête !' 'Prenez un comprimé !' 'Quel comprimé ?' 'Celui que je vous donne !' 💊",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de ménage ? Parce qu'ils préfèrent que quelqu'un d'autre le fasse ! 🧹",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai perdu mon portefeuille !' 'Où l'as-tu perdu ?' 'Je ne sais pas, il ne répond plus !' 💼",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais n'utilisent jamais de GPS ? Parce qu'ils connaissent toujours le chemin ! 🗺️",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais va au restaurant : 'Je veux manger !' 'Qu'est-ce que vous voulez ?' 'Ce que vous avez !' 🍽️",
-                        "🇬🇦 *Blague gabonaise :* Pourquoi les Gabonais ne font jamais de sport ? Parce qu'ils préfèrent regarder la télé ! 📺",
-                        "🇬🇦 *Blague gabonaise :* Un Gabonais dit : 'J'ai acheté un téléphone !' 'C'est bien !' 'Oui, maintenant je peux appeler !' 📞",
-                        "💻 *Blague tech :* Pourquoi les programmeurs confondent-ils Halloween et Noël ? Parce que 31 OCT = 25 DEC ! 🎃"
-                    ];
-                    const randomJoke = jokes[Math.floor(Math.random() * jokes.length)];
+                case 'joke': {
+                    const randomJoke = BOT_JOKES[Math.floor(Math.random() * BOT_JOKES.length)];
                     await sock.sendMessage(jid, {
                         text: `😂 *BLAGUE DU JOUR* 😂\n\n${randomJoke}\n\n🤣 J'espère que ça t'a fait rire ! Tape \`-joke\` pour une autre blague !`
                     });
                     break;
+                }
                     
-                case 'quote':
-                    const quotes = [
-                        "🌟 *Citation inspirante :* 'Le succès, c'est tomber sept fois et se relever huit.' - Proverbe japonais",
-                        "💡 *Citation de Steve Jobs :* 'L'innovation distingue un leader d'un suiveur.'",
-                        "💻 *Citation tech :* 'Le code est comme l'humour. Quand on doit l'expliquer, c'est mauvais.' - Cory House",
-                        "❤️ *Citation de Steve Jobs :* 'La seule façon de faire du bon travail, c'est d'aimer ce que vous faites.'",
-                        "🚀 *Citation de Steve Jobs :* 'Soyez insatiables. Soyez fous.'",
-                        "🎯 *Citation de Steve Jobs :* 'Votre temps est limité, ne le gaspillez pas en vivant la vie de quelqu'un d'autre.'",
-                        "💡 *Citation de Steve Jobs :* 'L'innovation, c'est la différence entre un leader et un suiveur.'",
-                        "🌟 *Citation de Steve Jobs :* 'La simplicité est la sophistication suprême.'",
-                        "🎨 *Citation de Steve Jobs :* 'Le design n'est pas seulement à quoi ça ressemble et à quoi ça donne l'impression. Le design, c'est comment ça fonctionne.'",
-                        "💪 *Citation de Steve Jobs :* 'Restez affamés. Restez fous.'",
-                        "🎯 *Citation de Steve Jobs :* 'Les gens ne savent pas ce qu'ils veulent jusqu'à ce que vous le leur montriez.'",
-                        "🌟 *Citation de Steve Jobs :* 'La qualité est plus importante que la quantité.'",
-                        "💡 *Citation de Steve Jobs :* 'L'innovation, c'est distinguer un leader d'un suiveur.'",
-                        "🎨 *Citation de Steve Jobs :* 'Le design, ce n'est pas seulement à quoi ça ressemble. Le design, c'est comment ça fonctionne.'",
-                        "🚀 *Citation de Steve Jobs :* 'Soyez insatiables. Soyez fous.'",
-                        "💪 *Citation de Steve Jobs :* 'Restez affamés. Restez fous.'",
-                        "🎯 *Citation de Steve Jobs :* 'Les gens ne savent pas ce qu'ils veulent jusqu'à ce que vous le leur montriez.'",
-                        "🌟 *Citation de Steve Jobs :* 'La qualité est plus importante que la quantité.'",
-                        "💡 *Citation de Steve Jobs :* 'L'innovation, c'est distinguer un leader d'un suiveur.'",
-                        "🎨 *Citation de Steve Jobs :* 'Le design, ce n'est pas seulement à quoi ça ressemble. Le design, c'est comment ça fonctionne.'",
-                        "🚀 *Citation de Steve Jobs :* 'Soyez insatiables. Soyez fous.'",
-                        "💪 *Citation de Steve Jobs :* 'Restez affamés. Restez fous.'",
-                        "🎯 *Citation de Steve Jobs :* 'Les gens ne savent pas ce qu'ils veulent jusqu'à ce que vous le leur montriez.'",
-                        "🌟 *Citation de Steve Jobs :* 'La qualité est plus importante que la quantité.'",
-                        "💡 *Citation de Steve Jobs :* 'L'innovation, c'est distinguer un leader d'un suiveur.'",
-                        "🎨 *Citation de Steve Jobs :* 'Le design, ce n'est pas seulement à quoi ça ressemble. Le design, c'est comment ça fonctionne.'",
-                        "🚀 *Citation de Steve Jobs :* 'Soyez insatiables. Soyez fous.'",
-                        "💪 *Citation de Steve Jobs :* 'Restez affamés. Restez fous.'",
-                        "🎯 *Citation de Steve Jobs :* 'Les gens ne savent pas ce qu'ils veulent jusqu'à ce que vous le leur montriez.'",
-                        "🌟 *Citation de Steve Jobs :* 'La qualité est plus importante que la quantité.'",
-                        "🔧 *Citation tech :* 'Il n'y a que deux types de langages de programmation : ceux dont les gens se plaignent et ceux que personne n'utilise.' - Bjarne Stroustrup",
-                        "🎯 *Citation tech :* 'Premièrement, résolvez le problème. Puis, écrivez le code.' - John Johnson",
-                        "✨ *Citation inspirante :* 'La perfection est atteinte, non pas lorsqu'il n'y a plus rien à ajouter, mais lorsqu'il n'y a plus rien à retirer.' - Antoine de Saint-Exupéry",
-                        "🎓 *Citation inspirante :* 'Un expert est une personne qui a commis toutes les erreurs possibles dans un domaine très restreint.' - Niels Bohr",
-                        "📚 *Citation inspirante :* 'L'expérience est le nom que chacun donne à ses erreurs.' - Oscar Wilde",
-                        "🚀 *Citation inspirante :* 'Dans 20 ans, vous serez plus déçu par les choses que vous n'avez pas faites que par celles que vous avez faites.' - Mark Twain"
-                    ];
-                    const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
+                case 'quote': {
+                    const randomQuote = BOT_QUOTES[Math.floor(Math.random() * BOT_QUOTES.length)];
                     await sock.sendMessage(jid, {
                         text: `✨ *CITATION INSPIRANTE* ✨\n\n_${randomQuote}_\n\n💭 Réfléchis-y ! Tape \`-quote\` pour une autre citation !`
                     });
                     break;
+                }
                     
                 case 'fact':
                     const facts = [
@@ -5264,8 +6436,7 @@ sock.ev.on('messages.upsert', async (m) => {
                             if (videoPath) {
                                 const videoBuffer = fs.readFileSync(videoPath);
                                 await sock.sendMessage(jid, {
-                                    video: videoBuffer,
-                                    caption: '🎉 Voilà ta vidéo ! J\'ai réussi à la télécharger pour toi ! Amuse-toi bien ! 😊'
+                                    video: videoBuffer
                                 });
                                 fs.unlinkSync(videoPath);
                             } else {
@@ -5298,27 +6469,24 @@ sock.ev.on('messages.upsert', async (m) => {
                         const query = fullCommand.slice(6).trim(); // "gimage" = 6 caractères
                         if (query) {
                             await sock.sendMessage(jid, {
-                                text: '🖼️ Cool ! Je cherche des images pour toi, un instant... 😊'
+                                text: '🖼️ Je cherche plusieurs images (aperçus + sources), un instant… 😊'
                             });
-                            
-                            const imageUrl = await searchGoogleImages(query);
-                            if (imageUrl) {
-                                try {
-                                    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-                                    const imageBuffer = Buffer.from(response.data);
+
+                            const buffers = await fetchGimageBuffersForQuery(query, GIMAGE_MAX_PER_COMMAND);
+                            if (buffers.length === 0) {
+                                await sock.sendMessage(jid, {
+                                    text: '😅 Aucune image téléchargeable pour cette recherche (liens bloqués ou format non pris en charge). Réessaie avec d’autres mots-clés ! 🤗'
+                                });
+                            } else {
+                                const n = buffers.length;
+                                for (let i = 0; i < n; i++) {
                                     await sock.sendMessage(jid, {
-                                        image: imageBuffer,
-                                        caption: `🎉 Voilà ! J'ai trouvé cette image pour "${query}" ! J'espère que ça te plaît ! 😊`
-                                    });
-                                } catch (error) {
-                                    await sock.sendMessage(jid, {
-                                        text: '😅 Oups ! J\'ai eu un problème avec cette image. Peux-tu réessayer ? 🤗'
+                                        image: buffers[i],
+                                        caption:
+                                            `🖼️ *${query}*\n` +
+                                            `📷 Image ${i + 1}/${n} — nouvelle recherche = nouveau mélange aléatoire.`
                                     });
                                 }
-                            } else {
-                                await sock.sendMessage(jid, {
-                                    text: '😅 Désolé, je n\'ai pas trouvé d\'image pour cette recherche. Essaie avec d\'autres mots-clés ! 🤗'
-                                });
                             }
                         } else {
                             await sock.sendMessage(jid, {
@@ -5374,14 +6542,27 @@ sock.ev.on('messages.upsert', async (m) => {
             const cleanText = messageText.trim();
             if (!cleanText) return;
             
-            const localReply = getLocalChatReply(cleanText);
+            const skipShortLocal = shouldSkipLocalAutoReplies(chatThreadJid);
+            const localReply = getLocalChatReply(cleanText, { skipShortLocal, jid: chatThreadJid });
             if (localReply) {
                 await sock.sendMessage(jid, { text: localReply });
+                // Si c'est une fin de conversation type "ok/top", on enchaîne avec le sticker dédié
+                const lowerClean = cleanText.toLowerCase();
+                if (CONVERSATION_CLOSER_STICKER_PATH && fs.existsSync(CONVERSATION_CLOSER_STICKER_PATH) && isConversationCloser(lowerClean)) {
+                    try {
+                        const stickerBuffer = fs.readFileSync(CONVERSATION_CLOSER_STICKER_PATH);
+                        await sock.sendMessage(jid, { sticker: stickerBuffer });
+                    } catch (e) {
+                        console.log('⚠️ Impossible d\'envoyer le sticker de fin de conversation:', e.message);
+                    }
+                }
+                appendChatHistoryTurn(chatThreadJid, 'user', cleanText);
+                appendChatHistoryTurn(chatThreadJid, 'assistant', localReply);
                 return;
             }
 
             try {
-                const aiResponse = await askGeminiWithFallback(cleanText);
+                const aiResponse = await askGeminiWithFallback(cleanText, { jid: chatThreadJid, recordHistory: true });
                 if (aiResponse && aiResponse.trim()) {
                     await sock.sendMessage(jid, { text: aiResponse });
                 }
