@@ -79,10 +79,23 @@ function resolveYtDlpBin() {
     return null;
 }
 
+/** Cookies Netscape pour YouTube (anti « Sign in to confirm you’re not a bot »). */
+function getYtDlpCookieArgs() {
+    const cookieFile = String(process.env.YTDLP_COOKIES || process.env.COOKIES_FILE || '').trim();
+    if (cookieFile && fs.existsSync(cookieFile)) {
+        return ['--cookies', cookieFile];
+    }
+    const fromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
+    if (fromBrowser) {
+        return ['--cookies-from-browser', fromBrowser];
+    }
+    return [];
+}
+
 function runYtDlp(args) {
     const bin = resolveYtDlpBin();
     if (!bin) {
-        return Promise.reject(new Error('yt-dlp introuvable (YTDLP_PATH ou Backend_tiktok/bin/yt-dlp)'));
+        return Promise.reject(new Error('yt-dlp introuvable (YTDLP_PATH ou /usr/local/bin/yt-dlp)'));
     }
     return new Promise((resolve, reject) => {
         const child = spawn(bin, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -101,7 +114,14 @@ function runYtDlp(args) {
         child.on('close', (code) => {
             clearTimeout(timer);
             if (code === 0) resolve();
-            else reject(new Error(stderr.trim().split('\n').slice(-3).join(' ') || `yt-dlp exit ${code}`));
+            else {
+                const msg = stderr.trim().split('\n').slice(-3).join(' ') || `yt-dlp exit ${code}`;
+                if (/Sign in to confirm|not a bot|cookies/i.test(msg) && !getYtDlpCookieArgs().length) {
+                    reject(new Error(`${msg} → configure YTDLP_COOKIES=/chemin/cookies.txt sur le VPS`));
+                } else {
+                    reject(new Error(msg));
+                }
+            }
         });
     });
 }
@@ -340,7 +360,9 @@ async function downloadViaPinterestFallback(url, outputPath) {
 async function downloadViaYtDlp(url, outputPath) {
     const tmpPattern = `${outputPath}.tmp.%(ext)s`;
     const platform = detectPlatform(url);
+    const cookieArgs = getYtDlpCookieArgs();
     const args = [
+        ...cookieArgs,
         '--no-playlist',
         '--no-warnings',
         '--no-check-certificates',
@@ -350,9 +372,15 @@ async function downloadViaYtDlp(url, outputPath) {
     ];
 
     if (platform === 'youtube') {
-        args.splice(0, 0, '--extractor-args', 'youtube:player_client=android');
+        // android seul est souvent bloqué sur VPS ; cookies + clients multiples
+        args.splice(0, 0, '--extractor-args', 'youtube:player_client=android,ios,tv,mweb');
         args.splice(0, 0, '-f', '18/best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best');
         args.splice(0, 0, '--merge-output-format', 'mp4');
+        if (cookieArgs.length) {
+            console.log('🍪 yt-dlp YouTube avec cookies');
+        } else {
+            console.log('⚠️ yt-dlp YouTube sans cookies (souvent bloqué sur VPS)');
+        }
     } else {
         // Facebook / Instagram : laisser yt-dlp choisir (plus fiable que Cobalt)
         args.splice(0, 0, '-f', 'best[ext=mp4]/best');
