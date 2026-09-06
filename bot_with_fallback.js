@@ -4813,6 +4813,21 @@ async function startBot() {
             }
             isBotStarting = false;
 
+            // QR non scanné / timeout (408) : ne pas boucler à l'infini sous PM2
+            const isQrTimeout =
+                statusCode === DisconnectReason.timedOut ||
+                statusCode === 408 ||
+                String(error?.message || '').includes('QR refs');
+            if (isQrTimeout && !alreadyRegistered) {
+                console.log('⏰ QR / auth expiré — arrêt des reconnexions automatiques.');
+                console.log('👉 Stoppe PM2 puis connecte-toi en avant-plan :');
+                printLoginHelp(authConfig.phone || '24165255707');
+                console.log('   npx pm2 stop Juxt_Rts_Bot');
+                console.log('   node bot_with_fallback.js --pairing 24165255707');
+                console.log('   # ou: node bot_with_fallback.js --qr');
+                return;
+            }
+
             // 401 pendant un pairing = session auth_info inconsistante → reset 1 fois puis retry
             if (
                 wantPairing &&
@@ -4852,6 +4867,13 @@ async function startBot() {
             if (shouldReconnect) {
                 if (isReconnectScheduled) {
                     console.log('⚠️ Reconnexion déjà planifiée, nouvelle tentative ignorée');
+                    return;
+                }
+
+                // Cap anti-boucle (surtout utile sous PM2)
+                if (reconnectAttempts >= 5 && !alreadyRegistered) {
+                    console.log('🛑 Trop de reconnexions sans session — stop.');
+                    printLoginHelp(authConfig.phone || '24165255707');
                     return;
                 }
 
