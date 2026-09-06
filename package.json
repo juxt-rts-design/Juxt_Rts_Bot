@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node bot_with_fallback.js",
     "bot": "node bot_with_fallback.js",
+    "login": "node bot_with_fallback.js --login",
+    "login:qr": "node bot_with_fallback.js --qr",
+    "login:code": "node bot_with_fallback.js --pairing",
+    "login:help": "node bot_with_fallback.js --help-login",
     "server": "node server_with_fallback.js",
     "dev": "nodemon server_with_fallback.js",
     "test": "echo \"No tests configured\"",

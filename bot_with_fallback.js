@@ -38,30 +38,40 @@ const webp = require('webp-converter');
 // Sticker de confirmation pour les fins de discussion type "ok/top"
 const CONVERSATION_CLOSER_STICKER_PATH = path.join(__dirname, 'temp_sticker_1758140893042.webp');
 
-/** Auth WhatsApp : qr | pairing | auto (pairing si PAIRING_PHONE, sinon QR) */
-function parseCliPairingPhone() {
+/** Config auth WhatsApp (mutable : CLI / --login). */
+const authConfig = {
+    /** 'qr' | 'pairing' | 'both' */
+    method: 'qr',
+    phone: '',
+    fromCli: false
+};
+
+function parseCliArgValue(flags) {
     const argv = process.argv.slice(2);
-    const idx = argv.findIndex((a) => a === '--pairing' || a === '--pair' || a === '--phone');
-    if (idx >= 0 && argv[idx + 1] && !argv[idx + 1].startsWith('-')) {
-        return argv[idx + 1];
+    for (const flag of flags) {
+        const idx = argv.findIndex((a) => a === flag);
+        if (idx >= 0 && argv[idx + 1] && !argv[idx + 1].startsWith('-')) {
+            return argv[idx + 1];
+        }
+        const eq = argv.find((a) => a.startsWith(`${flag}=`));
+        if (eq) return eq.slice(flag.length + 1);
     }
-    const eq = argv.find((a) => a.startsWith('--pairing=') || a.startsWith('--phone='));
-    if (eq) return eq.split('=').slice(1).join('=');
     return null;
+}
+
+function cliHasFlag(...flags) {
+    const argv = process.argv.slice(2);
+    return flags.some((f) => argv.includes(f) || argv.some((a) => a.startsWith(`${f}=`)));
 }
 
 function normalizePairingPhone(raw) {
     if (!raw) return '';
-    // +241 06 52 55 70 7 → chiffres seuls
     let digits = String(raw).replace(/\D/g, '');
     if (digits.startsWith('00')) digits = digits.slice(2);
-
-    // Gabon (+241) : le 0 national ne doit PAS rester (06… → 6…)
-    // Ex: 241065255707 → 24165255707
+    // Gabon : 2410xxxxxxxx → 241xxxxxxxx
     if (digits.startsWith('2410') && digits.length >= 11) {
         digits = '241' + digits.slice(4);
     }
-    // Autres pays fréquents : 33/32/34/39/44/49 + 0…
     const trunkDrop = digits.match(/^(33|32|34|39|44|49|237|225|221|226)0(\d{8,})$/);
     if (trunkDrop) {
         digits = trunkDrop[1] + trunkDrop[2];
@@ -69,17 +79,127 @@ function normalizePairingPhone(raw) {
     return digits;
 }
 
-const CLI_PAIRING_PHONE = normalizePairingPhone(parseCliPairingPhone());
-const PAIRING_PHONE = normalizePairingPhone(process.env.PAIRING_PHONE || CLI_PAIRING_PHONE || '');
-let AUTH_METHOD = String(process.env.AUTH_METHOD || 'auto').toLowerCase().trim();
-// --pairing : code en priorité + QR en secours (caméra faible)
-if (CLI_PAIRING_PHONE) AUTH_METHOD = 'both';
-if (AUTH_METHOD === 'auto') {
-    AUTH_METHOD = PAIRING_PHONE ? 'both' : 'qr';
+function printLoginHelp(phoneHint = '24165255707') {
+    const p = phoneHint || '24165255707';
+    console.log(`
+╔══════════════════════════════════════════════════╗
+║     CONNEXION WHATSAPP — 2 POSSIBILITÉS          ║
+╠══════════════════════════════════════════════════╣
+║  1) CODE d'authentification (idéal VPS)         ║
+║     npx pm2 stop Juxt_Rts_Bot                    ║
+║     node bot_with_fallback.js --pairing ${p}
+║                                                  ║
+║     Puis sur le téléphone :                      ║
+║     Appareils connectés → Connecter appareil     ║
+║     → « Connecter avec un numéro de téléphone »  ║
+║                                                  ║
+║  2) QR CODE (si ta caméra scanne bien)           ║
+║     npx pm2 stop Juxt_Rts_Bot                    ║
+║     node bot_with_fallback.js --qr               ║
+║                                                  ║
+║  Menu interactif :                               ║
+║     node bot_with_fallback.js --login            ║
+║                                                  ║
+║  Les deux en même temps (code + QR) :            ║
+║     node bot_with_fallback.js --both ${p}
+╚══════════════════════════════════════════════════╝
+`);
 }
-// pairing | code → code uniquement ; both → code + QR ; qr → QR seul
-const USE_PAIRING_CODE = AUTH_METHOD === 'pairing' || AUTH_METHOD === 'code' || AUTH_METHOD === 'both';
-const USE_QR_AUTH = AUTH_METHOD === 'qr' || AUTH_METHOD === 'both';
+
+function applyAuthFromCliAndEnv() {
+    const envPhone = normalizePairingPhone(process.env.PAIRING_PHONE || '');
+    let method = String(process.env.AUTH_METHOD || 'auto').toLowerCase().trim();
+    let phone = envPhone;
+
+    if (cliHasFlag('--help-login', '--auth-help', '--login-help')) {
+        printLoginHelp(phone || '24165255707');
+        process.exit(0);
+    }
+
+    if (cliHasFlag('--qr', '--qrcode')) {
+        method = 'qr';
+        authConfig.fromCli = true;
+    }
+
+    const pairingPhone = normalizePairingPhone(
+        parseCliArgValue(['--pairing', '--pair', '--phone', '--code'])
+    );
+    if (pairingPhone || cliHasFlag('--pairing', '--pair', '--code')) {
+        method = 'pairing';
+        if (pairingPhone) phone = pairingPhone;
+        authConfig.fromCli = true;
+    }
+
+    const bothPhone = normalizePairingPhone(parseCliArgValue(['--both']));
+    if (bothPhone || cliHasFlag('--both')) {
+        method = 'both';
+        if (bothPhone) phone = bothPhone;
+        authConfig.fromCli = true;
+    }
+
+    if (cliHasFlag('--login')) {
+        authConfig.fromCli = true;
+        // résolu plus bas de façon interactive avant startBot
+        method = method === 'auto' ? 'ask' : method;
+    }
+
+    if (method === 'auto') {
+        method = phone ? 'both' : 'qr';
+    }
+
+    authConfig.method = method;
+    authConfig.phone = phone;
+}
+
+applyAuthFromCliAndEnv();
+
+function wantPairingAuth() {
+    return authConfig.method === 'pairing' || authConfig.method === 'code' || authConfig.method === 'both';
+}
+
+function wantQrAuth() {
+    return authConfig.method === 'qr' || authConfig.method === 'both' || authConfig.method === 'pairing';
+}
+
+async function maybeAskLoginMethodInteractive() {
+    if (authConfig.method !== 'ask') return;
+    if (!process.stdin.isTTY) {
+        console.log('⚠️ --login sans TTY → QR par défaut. Utilise --pairing NUMERO ou --qr');
+        printLoginHelp(authConfig.phone || '24165255707');
+        authConfig.method = 'qr';
+        return;
+    }
+
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+    printLoginHelp(authConfig.phone || '24165255707');
+    console.log('Choisis une méthode :');
+    console.log('  [1] Code d’authentification (numéro)');
+    console.log('  [2] QR Code');
+    console.log('  [3] Les deux (code + QR)');
+    const choice = String(await ask('Ton choix (1/2/3) : ')).trim();
+
+    if (choice === '1' || choice === '3') {
+        authConfig.method = choice === '3' ? 'both' : 'pairing';
+        if (!authConfig.phone) {
+            const raw = await ask('Numéro WhatsApp (ex: 24165255707, sans +) : ');
+            authConfig.phone = normalizePairingPhone(raw);
+        }
+        if (!authConfig.phone) {
+            console.error('❌ Numéro requis pour le code.');
+            rl.close();
+            process.exit(1);
+        }
+    } else {
+        authConfig.method = 'qr';
+    }
+    rl.close();
+    console.log(`✅ Méthode : ${authConfig.method}${authConfig.phone ? ` (+${authConfig.phone})` : ''}`);
+}
+
+// Compat : le numéro actif est toujours authConfig.phone (mis à jour par --login)
 
 const PREFIX = process.env.PREFIX || '-';
 const CREATOR_CONTACT = process.env.CREATOR_CONTACT || '+241076234942@s.whatsapp.net';
@@ -384,8 +504,11 @@ console.log('GEMINI_MODEL:', GEMINI_MODEL);
 console.log('GEMINI_MAX_OUTPUT_TOKENS:', GEMINI_MAX_OUTPUT_TOKENS);
 console.log('CREATOR_CONTACT:', CREATOR_CONTACT);
 console.log('SESSION_DIR:', SESSION_DIR);
-console.log('AUTH_METHOD:', USE_PAIRING_CODE ? 'pairing (code)' : 'qr');
-if (PAIRING_PHONE) console.log('PAIRING_PHONE:', PAIRING_PHONE);
+console.log('AUTH_METHOD:', authConfig.method);
+if (authConfig.phone) console.log('PAIRING_PHONE:', authConfig.phone);
+if (!authConfig.fromCli && authConfig.method === 'qr') {
+    console.log('💡 Connexion : --qr  |  --pairing 24165255707  |  --login  |  --help-login');
+}
 
 // Initialisation du gestionnaire de fallback
 const fallbackHandler = new FallbackHandler();
@@ -4557,29 +4680,33 @@ async function startBot() {
     console.log(`Utilisation de Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
     const alreadyRegistered = Boolean(state.creds?.registered);
-    const wantPairing = USE_PAIRING_CODE && !alreadyRegistered;
+    const pairingPhone = authConfig.phone;
+    const wantPairing = wantPairingAuth() && !alreadyRegistered;
+    const showQr = wantQrAuth();
 
-    if (wantPairing && !PAIRING_PHONE) {
-        console.error('❌ AUTH_METHOD=pairing mais PAIRING_PHONE manquant');
-        console.error('   Exemple: PAIRING_PHONE=24165255707  (indicatif + numéro SANS le 0)');
-        console.error('   Ou: node bot_with_fallback.js --pairing 24165255707');
+    if (!alreadyRegistered) {
+        printLoginHelp(pairingPhone || '24165255707');
+        console.log(`▶️  Mode actif : ${authConfig.method}${pairingPhone ? ` (+${pairingPhone})` : ''}\n`);
+    }
+
+    if (wantPairing && !pairingPhone) {
+        console.error('❌ Mode code choisi mais numéro manquant');
+        console.error('   Exemple: node bot_with_fallback.js --pairing 24165255707');
+        console.error('   Ou:      node bot_with_fallback.js --login');
         isBotStarting = false;
         return;
     }
 
     if (wantPairing) {
-        console.log(`🔐 Mode pairing prêt — numéro normalisé: +${PAIRING_PHONE}`);
-        if (String(process.env.PAIRING_PHONE || CLI_PAIRING_PHONE || '').replace(/\D/g, '').includes('2410')) {
-            console.log('ℹ️  Le 0 après +241 a été retiré (format WhatsApp international).');
-        }
+        console.log(`🔐 Code d’auth demandé pour +${pairingPhone}`);
     }
 
-    // Pairing code: navigateur type Ubuntu (recommandé Baileys). QR: Chrome custom OK.
+    // Pairing code: navigateur type Ubuntu (recommandé Baileys).
     const sock = makeWASocket({
         version,
         logger,
         auth: state,
-        browser: wantPairing ? Browsers.ubuntu('Chrome') : Browsers.ubuntu('Chrome'),
+        browser: Browsers.ubuntu('Chrome'),
         connectTimeoutMs: WS_CONNECT_TIMEOUT_MS,
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000,
@@ -4597,80 +4724,76 @@ async function startBot() {
 
     async function requestPairingIfNeeded(reason = '') {
         if (pairingRequested || pairingCodeShown || alreadyRegistered || !wantPairing) return;
-        // Le socket doit être prêt (souvent signalé par l’événement qr)
-        if (!sock?.ws && !sock?.authState) return;
+        if (!sock?.authState) return;
 
         pairingRequested = true;
         try {
-            console.log('\n🔐 ===== CONNEXION PAR NUMÉRO (CODE) =====');
-            if (reason) console.log(`📡 Déclencheur: ${reason}`);
-            console.log(`📱 Numéro WhatsApp: +${PAIRING_PHONE}`);
+            console.log('\n╔══════════════════════════════════════════╗');
+            console.log('║  OPTION 1 — CODE D’AUTHENTIFICATION      ║');
+            console.log('╚══════════════════════════════════════════╝');
+            if (reason) console.log(`📡 ${reason}`);
+            console.log(`📱 Numéro: +${pairingPhone}`);
             console.log('⏳ Demande du code à WhatsApp…');
 
-            // Petite pause pour laisser le WS stabiliser (évite "Connection Closed")
             await new Promise((r) => setTimeout(r, 2000));
 
             if (!activeSocket || activeSocket !== sock) {
                 throw new Error('Socket déjà fermé avant la demande de code');
             }
 
-            const code = await sock.requestPairingCode(PAIRING_PHONE);
+            const code = await sock.requestPairingCode(pairingPhone);
             pairingCodeShown = true;
             const raw = String(code || '').replace(/\s+/g, '');
             const pretty = raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw;
-            console.log('\n✅ CODE D’AUTHENTIFICATION (valable ~1 min) :');
+            console.log('\n✅ TON CODE (≈ 1 minute) :');
             console.log(`\n   >>>  ${pretty}  <<<\n`);
-            console.log('Sur TON téléphone (WhatsApp déjà installé) :');
-            console.log('  1) Paramètres → Appareils connectés');
-            console.log('  2) Connecter un appareil');
-            console.log('  3) « Connecter avec un numéro de téléphone »');
-            console.log(`  4) Entre le code ${pretty}`);
-            console.log('==========================================\n');
-            console.log('💡 Le QR reste dispo si AUTH_METHOD=both (ou si le pairing échoue).');
+            console.log('Sur le téléphone WhatsApp :');
+            console.log('  Paramètres → Appareils connectés → Connecter un appareil');
+            console.log('  → « Connecter avec un numéro de téléphone »');
+            console.log(`  → entre : ${pretty}`);
+            console.log('──────────────────────────────────────────\n');
         } catch (err) {
             pairingRequested = false;
-            console.error('❌ Échec demande code pairing:', err.message);
-            console.log('↪️ Je laisse le QR s’afficher si WhatsApp en envoie un…');
+            console.error('❌ Échec code pairing:', err.message);
+            console.log('↪️ Passe par le QR (option 2) ci-dessous si affiché…');
         }
+    }
+
+    async function printQrOption(qr, asBackup) {
+        console.log(asBackup
+            ? '\n╔══════════════════════════════════════════╗\n║  OPTION 2 — QR CODE (secours caméra)     ║\n╚══════════════════════════════════════════╝'
+            : '\n╔══════════════════════════════════════════╗\n║  OPTION QR CODE                           ║\n╚══════════════════════════════════════════╝'
+        );
+        console.log(asBackup
+            ? 'Si le code ne marche pas, scanne ceci :'
+            : 'Scanne avec WhatsApp → Appareils connectés → Connecter un appareil');
+        try {
+            const qrCode = await qrcode.toString(qr, { type: 'terminal', small: true });
+            console.log(qrCode);
+        } catch (error) {
+            console.log(qr);
+        }
+        if (!wantPairing) {
+            console.log(`💡 Prefère un code ?  node bot_with_fallback.js --pairing ${pairingPhone || '24165255707'}`);
+        }
+        console.log('──────────────────────────────────────────\n');
     }
 
     // Gestion des événements de connexion
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // IMPORTANT: demander le code quand WhatsApp envoie un QR (= canal d’auth prêt)
-        // Trop tôt (sur "connecting") → Connection Closed / 401
-        if (qr && wantPairing && !pairingCodeShown) {
-            await requestPairingIfNeeded('qr-ready');
-            // Mode pairing pur: pas d’affichage QR. Mode both/qr: on affiche aussi.
-            if (!USE_QR_AUTH) {
-                // ne pas afficher le QR
-            } else {
-                console.log('\n📱 ===== QR CODE (secours caméra) =====');
-                console.log('Si le code ne marche pas, scanne ceci :');
-                try {
-                    const qrCode = await qrcode.toString(qr, { type: 'terminal', small: true });
-                    console.log(qrCode);
-                } catch (error) {
-                    console.log(qr);
+        if (qr) {
+            if (wantPairing && !pairingCodeShown) {
+                await requestPairingIfNeeded('canal auth prêt');
+                if (showQr) {
+                    await printQrOption(qr, true);
                 }
-                console.log('=====================================\n');
+            } else if (wantPairing && pairingCodeShown && showQr) {
+                await printQrOption(qr, true);
+            } else if (!wantPairing && showQr) {
+                await printQrOption(qr, false);
             }
-        } else if (qr && !wantPairing) {
-            console.log('\n📱 ===== QR CODE POUR CONNEXION WHATSAPP =====');
-            console.log('Scannez ce QR code avec votre téléphone :');
-            console.log('(WhatsApp → Appareils connectés → Connecter un appareil)');
-            try {
-                const qrCode = await qrcode.toString(qr, { type: 'terminal', small: true });
-                console.log(qrCode);
-            } catch (error) {
-                console.log('QR Code (format simple):');
-                console.log(qr);
-            }
-            if (PAIRING_PHONE) {
-                console.log(`💡 Ou code: node bot_with_fallback.js --pairing ${PAIRING_PHONE}`);
-            }
-            console.log('===============================================\n');
         }
         
         if (connection === 'close') {
@@ -4722,7 +4845,7 @@ async function startBot() {
             if (isSessionCorrupted) {
                 console.log('🚨 Session corrompue détectée dans le bot principal');
                 console.log('🛑 Arrêt du bot pour éviter les boucles infinies');
-                console.log('💡 Sur le VPS: rm -rf auth_info/* puis QR ou pairing');
+                console.log('💡 Sur le VPS: rm -rf auth_info/* puis --pairing ou --qr');
                 return;
             }
             
@@ -4745,11 +4868,8 @@ async function startBot() {
                     });
                 }, delayMs);
             } else {
-                console.log('🚪 Déconnecté (loggedOut) — nouvel auth QR ou pairing requis');
-                if (wantPairing) {
-                    console.log('💡 Relance avec: node bot_with_fallback.js --pairing 24165255707');
-                    console.log('   (Gabon: sans le 0 après 241)');
-                }
+                console.log('🚪 Déconnecté (loggedOut) — nouvel auth requis');
+                printLoginHelp(authConfig.phone || '24165255707');
             }
         } else if (connection === 'open') {
             reconnectAttempts = 0;
@@ -7025,5 +7145,13 @@ sock.ev.on('messages.upsert', async (m) => {
     }, 600000); // 10 minutes
 }
 
-// Démarrer le bot
-startBot().catch(console.error);
+// Démarrer le bot (après éventuel menu --login)
+(async () => {
+    try {
+        await maybeAskLoginMethodInteractive();
+        await startBot();
+    } catch (e) {
+        console.error(e);
+        process.exit(1);
+    }
+})();
