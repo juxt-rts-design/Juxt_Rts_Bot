@@ -24,8 +24,13 @@ function useCobaltLocal() {
 
 const YTDLP_CANDIDATES = [
     process.env.YTDLP_PATH,
+    path.join(__dirname, 'bin', 'yt-dlp'),
+    path.join(__dirname, '..', 'tik-tok', 'Backend_tiktok', 'bin', 'yt-dlp'),
     path.join(__dirname, '..', '..', 'tik-tok', 'Backend_tiktok', 'bin', 'yt-dlp'),
+    '/home/ubuntu/tik-tok/Backend_tiktok/bin/yt-dlp',
     '/home/hexaro/tik-tok/Backend_tiktok/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
     'yt-dlp'
 ].filter(Boolean);
 

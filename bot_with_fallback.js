@@ -1513,6 +1513,52 @@ function detectVideoLink(message) {
     return false;
 }
 
+/** Message = uniquement un lien vidéo (partage user), pas une réponse bot avec URL dedans. */
+function isBareVideoLinkOnly(text) {
+    const t = String(text || '').trim();
+    if (!t || !detectVideoLink(t)) return false;
+    const urls = t.match(/https?:\/\/[^\s]+/gi) || [];
+    if (urls.length !== 1) return false;
+    const rest = t.replace(urls[0], '').replace(/[\s*_\-~|.]+/g, '');
+    return rest.length === 0;
+}
+
+/** Réponses internes du bot à ignorer (évite boucle URL dans le message d’erreur). */
+function isBotVideoStatusSpam(text) {
+    const t = String(text || '');
+    return /Lien vidéo détecté|Impossible de récupérer ce média|Je télécharge la vidéo|DOWNLOADER_API_URL|yt-dlp|Moteur site Hexaro/i.test(t);
+}
+
+/** Anti-boucle : même URL en cours / échec récent. */
+const videoJobCooldown = new Map();
+const VIDEO_JOB_COOLDOWN_MS = 3 * 60 * 1000;
+
+function videoJobKey(url) {
+    return String(url || '').trim().split('?')[0].toLowerCase();
+}
+
+function beginVideoJob(url) {
+    const key = videoJobKey(url);
+    const now = Date.now();
+    const prev = videoJobCooldown.get(key);
+    if (prev && now - prev.ts < VIDEO_JOB_COOLDOWN_MS) {
+        return false;
+    }
+    videoJobCooldown.set(key, { ts: now, status: 'running' });
+    return true;
+}
+
+function endVideoJob(url, ok) {
+    const key = videoJobKey(url);
+    videoJobCooldown.set(key, { ts: Date.now(), status: ok ? 'ok' : 'fail' });
+    // Nettoyage léger
+    if (videoJobCooldown.size > 200) {
+        for (const [k, v] of videoJobCooldown) {
+            if (Date.now() - v.ts > VIDEO_JOB_COOLDOWN_MS) videoJobCooldown.delete(k);
+        }
+    }
+}
+
 /**
  * Extrait l'URL vidéo d'un message
  */
@@ -2096,9 +2142,8 @@ async function downloadViaSiteEngine(url, outputPath, sock, jid) {
         await sock.sendMessage(jid, {
             text:
                 `😅 *Impossible de récupérer ce média ${label}*\n\n` +
-                `🔗 ${url}\n\n` +
                 `🔧 ${error.message}\n\n` +
-                `💡 Vérifie que le lien est public et que DOWNLOADER_API_URL (ton site) est joignable.`
+                `💡 Lien public ? API Hexaro / yt-dlp OK sur le VPS ?`
         });
         safeUnlink(outputPath);
         return null;
@@ -4954,11 +4999,12 @@ sock.ev.on('messages.upsert', async (m) => {
         const messageText = normalizeWhatsAppMessageText(rawMessageText);
         const isCommandFromText = messageText.startsWith(PREFIX);
         const isVideoLinkMessage = !!messageText && detectVideoLink(messageText);
+        const isBareVideoOnly = isBareVideoLinkOnly(messageText);
         
         // En mode commandes uniquement, on laisse passer:
         // - les commandes préfixées
         // - les liens vidéo (TikTok/YouTube/etc.) pour téléchargement auto
-        if (COMMANDS_ONLY_MODE && !isCommandFromText && !isVideoLinkMessage) {
+        if (COMMANDS_ONLY_MODE && !isCommandFromText && !isBareVideoOnly) {
             return;
         }
         
@@ -4977,11 +5023,16 @@ sock.ev.on('messages.upsert', async (m) => {
         if (isJidNewsletter(jid)) {
             return;
         }
+
+        // Ne jamais retraiter les messages d’état du bot (sinon boucle sur l’URL dans l’erreur)
+        if (isBotVideoStatusSpam(messageText)) {
+            return;
+        }
         
         // Ignorer les messages envoyés par le bot, sauf:
         // - commandes explicites
-        // - liens vidéo (pour déclencher les téléchargements depuis son propre chat)
-        if (isFromMe && !isCommandFromText && !isVideoLinkMessage) return;
+        // - lien NU (juste l’URL) pour DL depuis son propre chat
+        if (isFromMe && !isCommandFromText && !isBareVideoOnly) return;
         
         // Anti-spam
         if (isMessageCached(messageId)) return;
@@ -5086,15 +5137,24 @@ sock.ev.on('messages.upsert', async (m) => {
         if (messageText.trim() && detectVideoLink(messageText)) {
             const videoUrl = extractVideoUrl(messageText);
             if (videoUrl) {
+                // fromMe : uniquement lien nu. Sinon n’importe quel message avec URL.
+                if (isFromMe && !isBareVideoOnly) {
+                    return;
+                }
+                if (!beginVideoJob(videoUrl)) {
+                    console.log('⏳ Lien déjà en cours / cooldown:', videoUrl);
+                    return;
+                }
                 console.log('🎬 Lien vidéo détecté:', videoUrl);
                 await sock.sendMessage(jid, {
                     text: '🎬 *Lien vidéo détecté !*\n\n⏳ Je télécharge la vidéo pour toi...'
                 });
-                // Pas de Promise.race/timeout qui coupe : Facebook/YT peuvent dépasser 60s
-                // (un faux "timeout" envoyait un message alors que le DL continuait)
-                downloadVideoFromUrl(videoUrl, sock, jid).catch((error) => {
-                    console.error('❌ Erreur téléchargement asynchrone:', error.message);
-                });
+                downloadVideoFromUrl(videoUrl, sock, jid)
+                    .then((ok) => endVideoJob(videoUrl, Boolean(ok)))
+                    .catch((error) => {
+                        endVideoJob(videoUrl, false);
+                        console.error('❌ Erreur téléchargement asynchrone:', error.message);
+                    });
                 return;
             }
         }
