@@ -1,3 +1,6 @@
+// Charger .env AVANT les modules qui lisent process.env (downloader, etc.)
+require('dotenv').config();
+
 const {
     default: makeWASocket,
     DisconnectReason,
@@ -5,7 +8,8 @@ const {
     fetchLatestBaileysVersion,
     downloadContentFromMessage,
     jidNormalizedUser,
-    isJidNewsletter
+    isJidNewsletter,
+    Browsers
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const P = require('pino');
@@ -18,6 +22,12 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 const FallbackHandler = require('./fallbackHandler');
+const {
+    isSiteDownloadPlatform,
+    downloadSiteMediaToFile,
+    sanitizeMediaUrl: sanitizeSiteMediaUrl,
+    detectPlatform: detectSitePlatform
+} = require('./siteMediaDownloader');
 const ytdl = require('@distube/ytdl-core');
 const puppeteer = require('puppeteer');
 const fbDownloader = require('fb-downloader-scrapper');
@@ -28,8 +38,48 @@ const webp = require('webp-converter');
 // Sticker de confirmation pour les fins de discussion type "ok/top"
 const CONVERSATION_CLOSER_STICKER_PATH = path.join(__dirname, 'temp_sticker_1758140893042.webp');
 
-// Configuration
-require('dotenv').config();
+/** Auth WhatsApp : qr | pairing | auto (pairing si PAIRING_PHONE, sinon QR) */
+function parseCliPairingPhone() {
+    const argv = process.argv.slice(2);
+    const idx = argv.findIndex((a) => a === '--pairing' || a === '--pair' || a === '--phone');
+    if (idx >= 0 && argv[idx + 1] && !argv[idx + 1].startsWith('-')) {
+        return argv[idx + 1];
+    }
+    const eq = argv.find((a) => a.startsWith('--pairing=') || a.startsWith('--phone='));
+    if (eq) return eq.split('=').slice(1).join('=');
+    return null;
+}
+
+function normalizePairingPhone(raw) {
+    if (!raw) return '';
+    // +241 06 52 55 70 7 → chiffres seuls
+    let digits = String(raw).replace(/\D/g, '');
+    if (digits.startsWith('00')) digits = digits.slice(2);
+
+    // Gabon (+241) : le 0 national ne doit PAS rester (06… → 6…)
+    // Ex: 241065255707 → 24165255707
+    if (digits.startsWith('2410') && digits.length >= 11) {
+        digits = '241' + digits.slice(4);
+    }
+    // Autres pays fréquents : 33/32/34/39/44/49 + 0…
+    const trunkDrop = digits.match(/^(33|32|34|39|44|49|237|225|221|226)0(\d{8,})$/);
+    if (trunkDrop) {
+        digits = trunkDrop[1] + trunkDrop[2];
+    }
+    return digits;
+}
+
+const CLI_PAIRING_PHONE = normalizePairingPhone(parseCliPairingPhone());
+const PAIRING_PHONE = normalizePairingPhone(process.env.PAIRING_PHONE || CLI_PAIRING_PHONE || '');
+let AUTH_METHOD = String(process.env.AUTH_METHOD || 'auto').toLowerCase().trim();
+// --pairing : code en priorité + QR en secours (caméra faible)
+if (CLI_PAIRING_PHONE) AUTH_METHOD = 'both';
+if (AUTH_METHOD === 'auto') {
+    AUTH_METHOD = PAIRING_PHONE ? 'both' : 'qr';
+}
+// pairing | code → code uniquement ; both → code + QR ; qr → QR seul
+const USE_PAIRING_CODE = AUTH_METHOD === 'pairing' || AUTH_METHOD === 'code' || AUTH_METHOD === 'both';
+const USE_QR_AUTH = AUTH_METHOD === 'qr' || AUTH_METHOD === 'both';
 
 const PREFIX = process.env.PREFIX || '-';
 const CREATOR_CONTACT = process.env.CREATOR_CONTACT || '+241076234942@s.whatsapp.net';
@@ -334,6 +384,8 @@ console.log('GEMINI_MODEL:', GEMINI_MODEL);
 console.log('GEMINI_MAX_OUTPUT_TOKENS:', GEMINI_MAX_OUTPUT_TOKENS);
 console.log('CREATOR_CONTACT:', CREATOR_CONTACT);
 console.log('SESSION_DIR:', SESSION_DIR);
+console.log('AUTH_METHOD:', USE_PAIRING_CODE ? 'pairing (code)' : 'qr');
+if (PAIRING_PHONE) console.log('PAIRING_PHONE:', PAIRING_PHONE);
 
 // Initialisation du gestionnaire de fallback
 const fallbackHandler = new FallbackHandler();
@@ -471,6 +523,8 @@ let reconnectAttempts = 0;
 let isBotStarting = false;
 let isReconnectScheduled = false;
 let activeSocket = null;
+/** Évite boucle infinie si 401 pendant un pairing (reset auth_info 1 fois max). */
+let pairing401Retries = 0;
 const BOT_STARTUP_UNIX = Math.floor(Date.now() / 1000);
 
 function getMessageTimestampSeconds(msg) {
@@ -1312,14 +1366,18 @@ async function processStatusCommand(sock, msg, jid) {
  */
 function detectVideoLink(message) {
     const videoPatterns = [
-        // Facebook patterns (plus larges)
-        /(?:https?:\/\/)?(?:www\.)?(?:facebook\.com\/.*\/videos\/|fb\.watch\/|m\.facebook\.com\/.*\/videos\/|facebook\.com\/share\/r\/)/i,
-        // YouTube patterns (incluant les Shorts)
-        /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|m\.youtube\.com\/watch\?v=|youtube\.com\/shorts\/|youtube\.com\/shorts\/)/i,
-        /(?:https?:\/\/)?(?:www\.)?(?:instagram\.com\/p\/|instagram\.com\/reel\/|instagram\.com\/tv\/)/i,
-        /(?:https?:\/\/)?(?:www\.)?(?:tiktok\.com\/@.*\/video\/|vm\.tiktok\.com\/|vt\.tiktok\.com\/)/i,
-        /(?:https?:\/\/)?(?:www\.)?(?:pinterest\.(com|fr)\/pin\/)/i,
-        /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com\/.*\/status\/|x\.com\/.*\/status\/)/i,
+        // Facebook
+        /(?:https?:\/\/)?(?:www\.|m\.)?(?:facebook\.com\/|fb\.watch\/|fb\.com\/)/i,
+        // YouTube (watch, shorts, youtu.be)
+        /(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/|youtu\.be\/)/i,
+        // Instagram
+        /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:p|reel|reels|tv|share)\//i,
+        // TikTok (inchangé — moteur dédié)
+        /(?:https?:\/\/)?(?:www\.)?(?:tiktok\.com\/|vm\.tiktok\.com\/|vt\.tiktok\.com\/)/i,
+        // Pinterest
+        /(?:https?:\/\/)?(?:www\.)?(?:pinterest\.(?:com|fr)\/pin\/|pin\.it\/)/i,
+        // X / Twitter
+        /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com\/|x\.com\/).*(?:status|statuses)\//i,
         /(?:https?:\/\/)?(?:www\.)?(?:vimeo\.com\/)/i,
         /(?:https?:\/\/)?(?:www\.)?(?:dailymotion\.com\/video\/)/i
     ];
@@ -1862,6 +1920,69 @@ async function processAudioTranscription(sock, jid, quotedMsg) {
 }
 
 /**
+ * Télécharge IG / FB / Pinterest / YouTube / X via le moteur Hexaro (site tik-tok).
+ * TikTok reste sur downloadTikTokVideo — ne pas mélanger.
+ */
+async function downloadViaSiteEngine(url, outputPath, sock, jid) {
+    const platform = detectSitePlatform(url) || 'web';
+    const labels = {
+        youtube: 'YouTube',
+        instagram: 'Instagram',
+        facebook: 'Facebook',
+        pinterest: 'Pinterest',
+        twitter: 'X'
+    };
+    const label = labels[platform] || platform;
+
+    try {
+        console.log(`🌐 Moteur site Hexaro → ${label}:`, url);
+        const result = await downloadSiteMediaToFile(url, outputPath);
+
+        if (!result?.path || !fs.existsSync(result.path) || fs.statSync(result.path).size < 512) {
+            throw new Error('Fichier média invalide');
+        }
+
+        const sizeMb = fs.statSync(result.path).size / (1024 * 1024);
+        if (sizeMb > 64) {
+            await sock.sendMessage(jid, {
+                text: `😅 *Fichier trop lourd (${sizeMb.toFixed(1)} Mo)*\n\nWhatsApp limite la taille. Essaie un autre lien ou une qualité plus courte.`
+            });
+            safeUnlink(result.path);
+            return null;
+        }
+
+        const mediaBuffer = fs.readFileSync(result.path);
+        if (result.isImage) {
+            await sock.sendMessage(jid, {
+                image: mediaBuffer,
+                caption: result.title ? `📌 *${label}*\n${result.title}` : undefined
+            });
+        } else {
+            await sock.sendMessage(jid, {
+                video: mediaBuffer,
+                caption: result.title ? `🎬 *${label}*\n${result.title}` : undefined
+            });
+        }
+
+        safeUnlink(result.path);
+        if (result.path !== outputPath) safeUnlink(outputPath);
+        console.log(`✅ ${label} envoyé via moteur site (${result.source})`);
+        return result.path;
+    } catch (error) {
+        console.error(`❌ Moteur site (${label}):`, error.message);
+        await sock.sendMessage(jid, {
+            text:
+                `😅 *Impossible de récupérer ce média ${label}*\n\n` +
+                `🔗 ${url}\n\n` +
+                `🔧 ${error.message}\n\n` +
+                `💡 Vérifie que le lien est public et que DOWNLOADER_API_URL (ton site) est joignable.`
+        });
+        safeUnlink(outputPath);
+        return null;
+    }
+}
+
+/**
  * Télécharge une vidéo depuis un lien
  */
 async function downloadVideoFromUrl(url, sock, jid) {
@@ -1874,22 +1995,20 @@ async function downloadVideoFromUrl(url, sock, jid) {
         }
         
         const outputPath = `./temp/video_${Date.now()}.mp4`;
-        
-        // Détecter la plateforme et appliquer des optimisations
-        if (url.includes('youtube.com') || url.includes('youtu.be')) {
-            return await downloadYouTubeVideo(url, outputPath, sock, jid);
-        } else if (url.includes('facebook.com') || url.includes('fb.watch')) {
-            return await downloadFacebookVideo(url, outputPath, sock, jid);
-        } else if (url.includes('instagram.com')) {
-            return await downloadInstagramVideo(url, outputPath, sock, jid);
-        } else if (url.includes('pinterest.')) {
-            return await downloadPinterestVideo(url, outputPath, sock, jid);
-        } else if (url.includes('tiktok.com')) {
-            return await downloadTikTokVideo(url, outputPath, sock, jid);
-        } else {
-            // Téléchargement générique
-            return await downloadGenericVideo(url, outputPath, sock, jid);
+        const cleanUrl = sanitizeSiteMediaUrl(url);
+
+        // TikTok : logique existante (ne pas toucher)
+        if (cleanUrl.includes('tiktok.com') || cleanUrl.includes('vm.tiktok.com') || cleanUrl.includes('vt.tiktok.com')) {
+            return await downloadTikTokVideo(cleanUrl, outputPath, sock, jid);
         }
+
+        // YouTube / Instagram / Facebook / Pinterest / X → stack site Hexaro
+        if (isSiteDownloadPlatform(cleanUrl)) {
+            return await downloadViaSiteEngine(cleanUrl, outputPath, sock, jid);
+        }
+
+        // Autres liens
+        return await downloadGenericVideo(cleanUrl, outputPath, sock, jid);
     } catch (error) {
         console.error('❌ Erreur téléchargement vidéo:', error.message);
         await sock.sendMessage(jid, {
@@ -3702,6 +3821,8 @@ const FIND_GOOGLE_AXIOS = { timeout: 35000, maxRedirects: 5 };
 const FIND_PUPPETEER_WAIT_MS = 3200;
 const FIND_SERP_USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+/** UA obligatoire pour Wikipedia / APIs (sinon 403). */
+const FIND_BOT_USER_AGENT = 'JuxtRtsBot/2.0 (WhatsApp find; local use) Node.js';
 
 function stripHtmlCollapse(s) {
     if (!s) return '';
@@ -3710,6 +3831,155 @@ function stripHtmlCollapse(s) {
         .replace(/<[^>]+>/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+/**
+ * DuckDuckGo Instant Answer (API publique, sans Chrome).
+ */
+async function searchDuckDuckGoInstant(query) {
+    const { data } = await axios.get('https://api.duckduckgo.com/', {
+        params: {
+            q: query,
+            format: 'json',
+            no_html: 1,
+            skip_disambig: 1
+        },
+        timeout: 15000,
+        headers: { 'User-Agent': FIND_BOT_USER_AGENT, Accept: 'application/json' }
+    });
+
+    const lines = [];
+    const heading = data?.Heading || '';
+    const abstract = String(data?.AbstractText || data?.Abstract || '').trim();
+
+    if (heading || abstract) {
+        if (heading) lines.push(`*${stripHtmlCollapse(heading)}*`);
+        if (abstract) lines.push(stripHtmlCollapse(abstract).slice(0, 1200));
+        if (data?.AbstractURL) lines.push(`🔗 ${data.AbstractURL}`);
+    }
+
+    const related = [];
+    const walk = (arr) => {
+        for (const item of arr || []) {
+            if (related.length >= 5) break;
+            if (item?.Text && item?.FirstURL) {
+                related.push({ title: item.Text, url: item.FirstURL });
+            } else if (Array.isArray(item?.Topics)) {
+                walk(item.Topics);
+            }
+        }
+    };
+    walk(data?.RelatedTopics);
+
+    if (related.length) {
+        if (lines.length) lines.push('');
+        lines.push('🔎 *Liens associés*');
+        related.forEach((r, i) => {
+            lines.push(`${i + 1}) ${stripHtmlCollapse(r.title).slice(0, 160)}`);
+            lines.push(`🔗 ${r.url}`);
+        });
+    }
+
+    if (!lines.length) return null;
+    return {
+        source: 'duckduckgo',
+        text: [`🔍 *Recherche :* ${query}`, '', ...lines].join('\n').slice(0, 6500)
+    };
+}
+
+/**
+ * Wikipedia opensearch + résumé (fr puis en).
+ */
+async function searchWikipediaFind(query) {
+    const headers = { 'User-Agent': FIND_BOT_USER_AGENT, Accept: 'application/json' };
+    const langs = ['fr', 'en'];
+
+    for (const lang of langs) {
+        try {
+            const { data } = await axios.get(`https://${lang}.wikipedia.org/w/api.php`, {
+                params: {
+                    action: 'opensearch',
+                    search: query,
+                    limit: 5,
+                    namespace: 0,
+                    format: 'json'
+                },
+                timeout: 15000,
+                headers
+            });
+
+            const titles = data?.[1] || [];
+            const urls = data?.[3] || [];
+            if (!titles.length) continue;
+
+            // Préférer la page moderne (chatbot / xAI) si présente dans les résultats
+            let bestIdx = 0;
+            const prefer = /chatbot|xai|\(xai\)|\bai\b|llm|musk/i;
+            for (let i = 0; i < titles.length; i++) {
+                if (prefer.test(String(titles[i]))) {
+                    bestIdx = i;
+                    break;
+                }
+            }
+
+            let extract = '';
+            let pageUrl = urls[bestIdx];
+            const bestTitle = titles[bestIdx];
+            try {
+                const titleSlug = encodeURIComponent(String(bestTitle).replace(/ /g, '_'));
+                const sum = await axios.get(
+                    `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${titleSlug}`,
+                    { timeout: 12000, headers }
+                );
+                extract = String(sum.data?.extract || '').trim();
+                pageUrl = sum.data?.content_urls?.desktop?.page || pageUrl;
+            } catch (_) {
+                // résumé optionnel
+            }
+
+            const lines = [`🔍 *Recherche :* ${query}`, '', `📚 *Wikipedia (${lang})*`];
+            if (extract) {
+                lines.push(`*${bestTitle}*`);
+                lines.push(extract.slice(0, 1400));
+                if (pageUrl) lines.push(`🔗 ${pageUrl}`);
+            }
+
+            lines.push('');
+            lines.push('🔎 *Autres pages*');
+            titles.slice(0, 5).forEach((t, i) => {
+                lines.push(`${i + 1}) *${t}*`);
+                if (urls[i]) lines.push(`🔗 ${urls[i]}`);
+            });
+
+            return {
+                source: `wikipedia-${lang}`,
+                text: lines.join('\n').slice(0, 6500)
+            };
+        } catch (e) {
+            console.warn(`Wikipedia (${lang}):`, e.message);
+        }
+    }
+    return null;
+}
+
+function hasUsableGoogleThisPayload(results) {
+    if (!results) return false;
+    if (Array.isArray(results.results) && results.results.some((o) => o && (o.title || o.url))) return true;
+    const fs = results.featured_snippet;
+    if (fs && (fs.description || fs.title)) return true;
+    const kp = results.knowledge_panel;
+    if (kp && (kp.description || kp.title)) return true;
+    return false;
+}
+
+function chromeAvailableForPuppeteer() {
+    try {
+        const puppeteerCore = require('puppeteer');
+        const execPath = typeof puppeteerCore.executablePath === 'function' ? puppeteerCore.executablePath() : null;
+        return Boolean(execPath && fs.existsSync(execPath));
+    } catch (_) {
+        return false;
+    }
 }
 
 /**
@@ -3848,6 +4118,9 @@ async function fetchGoogleSerpHtmlAxios(query, useGbv = false) {
 }
 
 async function fetchGoogleSerpHtmlPuppeteer(query) {
+    if (!chromeAvailableForPuppeteer()) {
+        throw new Error('Chrome Puppeteer absent — étape ignorée');
+    }
     let browser;
     try {
         browser = await puppeteer.launch({
@@ -3929,26 +4202,10 @@ function formatGoogleSearchReply(parsed, query, rawHtmlForAiExtract) {
     return lines.join('\n').slice(0, 6500);
 }
 
-async function searchGoogleAiSynthFallback(query) {
-    try {
-        const prompt =
-            `Recherche web simulée pour la requête : « ${query} ».\n` +
-            `Rédige en français une courte synthèse du type « aperçu en haut de Google » : 5 à 10 phrases maximum, claires, utiles, sans markdown lourd, sans liste longue. ` +
-            `Si tu manques d'infos fiables, dis-le en une phrase.`;
-        const text = await askGeminiWithFallback(prompt);
-        if (!text || !String(text).trim()) return null;
-        return (
-            `🔍 *Recherche :* ${query}\n\n` +
-            `🤖 *Synthèse (IA — Google indisponible ou page non lisible)*\n\n` +
-            String(text).trim().slice(0, 5500)
-        );
-    } catch (_) {
-        return null;
-    }
-}
-
 /**
- * Recherche sur Google : priorité à l’aperçu du haut (encart / IA quand présent dans le HTML), puis repli navigateur, puis IA.
+ * Recherche : DuckDuckGo + Wikipedia d’abord (fiables).
+ * Google/Puppeteer seulement s’ils donnent vraiment des résultats.
+ * Plus de fallback JSON hors sujet (Android pour « Grok », etc.).
  */
 function enrichFindReplyFromHtml(query, html) {
     if (!html) return '';
@@ -3967,50 +4224,81 @@ async function searchGoogle(query) {
     const q = String(query || '').trim();
     if (!q) return 'Indique ce que tu veux chercher. Exemple : `-find mma`';
 
+    // 1) Wikipedia (résumés fiables, sans Chrome)
+    try {
+        const wiki = await searchWikipediaFind(q);
+        if (wiki?.text) {
+            console.log('✅ -find via Wikipedia');
+            return wiki.text;
+        }
+    } catch (e) {
+        console.warn('Wikipedia find:', e.message);
+    }
+
+    // 2) DuckDuckGo Instant Answer
+    try {
+        const ddg = await searchDuckDuckGoInstant(q);
+        if (ddg?.text) {
+            console.log('✅ -find via DuckDuckGo');
+            return ddg.text;
+        }
+    } catch (e) {
+        console.warn('DuckDuckGo find:', e.message);
+    }
+
+    // 3) googlethis seulement s’il a du contenu réel
     try {
         const results = await executeGoogleThisSearch(q);
-        const msg = formatGoogleSearchReply(results, q, null);
-        if (msg?.trim()) return msg;
-        if (results.results && results.results.length > 0) {
-            const o = results.results[0];
-            return (
-                `🔍 *Recherche :* ${q}\n\n` +
-                `🔎 *${stripHtmlCollapse(o.title)}*\n` +
-                `${stripHtmlCollapse(o.description)}\n\n` +
-                `🔗 ${o.url}`
-            );
+        if (hasUsableGoogleThisPayload(results)) {
+            const msg = formatGoogleSearchReply(results, q, null);
+            if (msg?.trim()) {
+                console.log('✅ -find via googlethis');
+                return msg;
+            }
         }
-        // googlethis peut réussir avec 0 résultat parsé : continuer vers HTTP / Puppeteer / IA
     } catch (err) {
         console.error('Erreur recherche Google:', err.message);
     }
 
+    // 4) HTML Google (souvent vide / bloqué) — on tente vite
     try {
-        for (const useGbv of [false, true]) {
+        for (const useGbv of [true, false]) {
             const htmlAxios = await fetchGoogleSerpHtmlAxios(q, useGbv);
             if (htmlAxios && htmlAxios.length > 500) {
                 const fromHtml = enrichFindReplyFromHtml(q, htmlAxios);
-                if (fromHtml?.trim()) return fromHtml;
+                if (fromHtml?.trim() && fromHtml.split('\n').length > 2) {
+                    console.log('✅ -find via Google HTTP');
+                    return fromHtml;
+                }
             }
         }
     } catch (e) {
         console.error('Recherche Google (HTTP):', e.message);
     }
 
-    try {
-        const html = await fetchGoogleSerpHtmlPuppeteer(q);
-        if (html && html.length > 500) {
-            const fromHtml = enrichFindReplyFromHtml(q, html);
-            if (fromHtml?.trim()) return fromHtml;
+    // 5) Puppeteer uniquement si Chrome est installé
+    if (chromeAvailableForPuppeteer()) {
+        try {
+            const html = await fetchGoogleSerpHtmlPuppeteer(q);
+            if (html && html.length > 500) {
+                const fromHtml = enrichFindReplyFromHtml(q, html);
+                if (fromHtml?.trim() && fromHtml.split('\n').length > 2) {
+                    console.log('✅ -find via Puppeteer');
+                    return fromHtml;
+                }
+            }
+        } catch (e) {
+            console.error('Recherche Google (Puppeteer):', e.message);
         }
-    } catch (e) {
-        console.error('Recherche Google (Puppeteer):', e.message);
+    } else {
+        console.log('ℹ️ Puppeteer/Chrome absent — ignoré pour -find');
     }
 
-    const fallback = await searchGoogleAiSynthFallback(q);
-    if (fallback) return fallback;
-
-    return 'Erreur lors de la recherche Google. Réessaie plus tard ou reformule ta requête.';
+    return (
+        `🔍 *Recherche :* ${q}\n\n` +
+        `😅 Je n’ai pas trouvé de résultat fiable pour l’instant (Google bloqué / vide).\n\n` +
+        `💡 Reformule (ex: \`-find Grok xAI Elon Musk\`) ou réessaie dans un moment.`
+    );
 }
 
 const GIMAGE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
@@ -4268,29 +4556,110 @@ async function startBot() {
     
     console.log(`Utilisation de Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
+    const alreadyRegistered = Boolean(state.creds?.registered);
+    const wantPairing = USE_PAIRING_CODE && !alreadyRegistered;
+
+    if (wantPairing && !PAIRING_PHONE) {
+        console.error('❌ AUTH_METHOD=pairing mais PAIRING_PHONE manquant');
+        console.error('   Exemple: PAIRING_PHONE=24165255707  (indicatif + numéro SANS le 0)');
+        console.error('   Ou: node bot_with_fallback.js --pairing 24165255707');
+        isBotStarting = false;
+        return;
+    }
+
+    if (wantPairing) {
+        console.log(`🔐 Mode pairing prêt — numéro normalisé: +${PAIRING_PHONE}`);
+        if (String(process.env.PAIRING_PHONE || CLI_PAIRING_PHONE || '').replace(/\D/g, '').includes('2410')) {
+            console.log('ℹ️  Le 0 après +241 a été retiré (format WhatsApp international).');
+        }
+    }
+
+    // Pairing code: navigateur type Ubuntu (recommandé Baileys). QR: Chrome custom OK.
     const sock = makeWASocket({
         version,
         logger,
         auth: state,
-        browser: ['Juxt_Rts Bot', 'Chrome', '1.0.0'],
+        browser: wantPairing ? Browsers.ubuntu('Chrome') : Browsers.ubuntu('Chrome'),
         connectTimeoutMs: WS_CONNECT_TIMEOUT_MS,
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000,
         generateHighQualityLinkPreview: true,
         retryRequestDelayMs: 1000,
         maxMsgRetryCount: 3,
-        markOnlineOnConnect: false
+        markOnlineOnConnect: false,
+        printQRInTerminal: false
     });
 
     activeSocket = sock;
 
+    let pairingRequested = false;
+    let pairingCodeShown = false;
+
+    async function requestPairingIfNeeded(reason = '') {
+        if (pairingRequested || pairingCodeShown || alreadyRegistered || !wantPairing) return;
+        // Le socket doit être prêt (souvent signalé par l’événement qr)
+        if (!sock?.ws && !sock?.authState) return;
+
+        pairingRequested = true;
+        try {
+            console.log('\n🔐 ===== CONNEXION PAR NUMÉRO (CODE) =====');
+            if (reason) console.log(`📡 Déclencheur: ${reason}`);
+            console.log(`📱 Numéro WhatsApp: +${PAIRING_PHONE}`);
+            console.log('⏳ Demande du code à WhatsApp…');
+
+            // Petite pause pour laisser le WS stabiliser (évite "Connection Closed")
+            await new Promise((r) => setTimeout(r, 2000));
+
+            if (!activeSocket || activeSocket !== sock) {
+                throw new Error('Socket déjà fermé avant la demande de code');
+            }
+
+            const code = await sock.requestPairingCode(PAIRING_PHONE);
+            pairingCodeShown = true;
+            const raw = String(code || '').replace(/\s+/g, '');
+            const pretty = raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw;
+            console.log('\n✅ CODE D’AUTHENTIFICATION (valable ~1 min) :');
+            console.log(`\n   >>>  ${pretty}  <<<\n`);
+            console.log('Sur TON téléphone (WhatsApp déjà installé) :');
+            console.log('  1) Paramètres → Appareils connectés');
+            console.log('  2) Connecter un appareil');
+            console.log('  3) « Connecter avec un numéro de téléphone »');
+            console.log(`  4) Entre le code ${pretty}`);
+            console.log('==========================================\n');
+            console.log('💡 Le QR reste dispo si AUTH_METHOD=both (ou si le pairing échoue).');
+        } catch (err) {
+            pairingRequested = false;
+            console.error('❌ Échec demande code pairing:', err.message);
+            console.log('↪️ Je laisse le QR s’afficher si WhatsApp en envoie un…');
+        }
+    }
+
     // Gestion des événements de connexion
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
+
+        // IMPORTANT: demander le code quand WhatsApp envoie un QR (= canal d’auth prêt)
+        // Trop tôt (sur "connecting") → Connection Closed / 401
+        if (qr && wantPairing && !pairingCodeShown) {
+            await requestPairingIfNeeded('qr-ready');
+            // Mode pairing pur: pas d’affichage QR. Mode both/qr: on affiche aussi.
+            if (!USE_QR_AUTH) {
+                // ne pas afficher le QR
+            } else {
+                console.log('\n📱 ===== QR CODE (secours caméra) =====');
+                console.log('Si le code ne marche pas, scanne ceci :');
+                try {
+                    const qrCode = await qrcode.toString(qr, { type: 'terminal', small: true });
+                    console.log(qrCode);
+                } catch (error) {
+                    console.log(qr);
+                }
+                console.log('=====================================\n');
+            }
+        } else if (qr && !wantPairing) {
             console.log('\n📱 ===== QR CODE POUR CONNEXION WHATSAPP =====');
             console.log('Scannez ce QR code avec votre téléphone :');
+            console.log('(WhatsApp → Appareils connectés → Connecter un appareil)');
             try {
                 const qrCode = await qrcode.toString(qr, { type: 'terminal', small: true });
                 console.log(qrCode);
@@ -4298,19 +4667,21 @@ async function startBot() {
                 console.log('QR Code (format simple):');
                 console.log(qr);
             }
+            if (PAIRING_PHONE) {
+                console.log(`💡 Ou code: node bot_with_fallback.js --pairing ${PAIRING_PHONE}`);
+            }
             console.log('===============================================\n');
         }
         
         if (connection === 'close') {
             const error = lastDisconnect?.error;
             const statusCode = error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            let shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             console.log('Connexion fermée, reconnexion:', shouldReconnect);
             console.log('Détails erreur:', error?.message, 'Code:', statusCode);
 
             // Libérer le socket mort AVANT toute tentative de reconnexion
-            // (sinon startBot() refuse avec "instance déjà active")
             try {
                 sock.end?.(undefined);
             } catch (_) {}
@@ -4318,6 +4689,29 @@ async function startBot() {
                 activeSocket = null;
             }
             isBotStarting = false;
+
+            // 401 pendant un pairing = session auth_info inconsistante → reset 1 fois puis retry
+            if (
+                wantPairing &&
+                !pairingCodeShown &&
+                (statusCode === DisconnectReason.loggedOut || statusCode === 401) &&
+                pairing401Retries < 1
+            ) {
+                pairing401Retries += 1;
+                console.log('🧹 Reset auth_info (401 pendant pairing) puis nouvel essai…');
+                try {
+                    if (fs.existsSync(SESSION_DIR)) {
+                        for (const f of fs.readdirSync(SESSION_DIR)) {
+                            fs.unlinkSync(path.join(SESSION_DIR, f));
+                        }
+                    } else {
+                        fs.mkdirSync(SESSION_DIR, { recursive: true });
+                    }
+                } catch (e) {
+                    console.error('Reset auth_info:', e.message);
+                }
+                shouldReconnect = true;
+            }
             
             // Bad MAC / session cassée : stop (sauf 515 = restartRequired, normal au pairing)
             const isSessionCorrupted = (error?.message?.includes('Bad MAC') || 
@@ -4328,7 +4722,7 @@ async function startBot() {
             if (isSessionCorrupted) {
                 console.log('🚨 Session corrompue détectée dans le bot principal');
                 console.log('🛑 Arrêt du bot pour éviter les boucles infinies');
-                console.log('💡 Sur le VPS: rm -rf auth_info/* puis rescanner le QR');
+                console.log('💡 Sur le VPS: rm -rf auth_info/* puis QR ou pairing');
                 return;
             }
             
@@ -4351,7 +4745,11 @@ async function startBot() {
                     });
                 }, delayMs);
             } else {
-                console.log('🚪 Déconnecté (loggedOut) — nouvel scan QR requis');
+                console.log('🚪 Déconnecté (loggedOut) — nouvel auth QR ou pairing requis');
+                if (wantPairing) {
+                    console.log('💡 Relance avec: node bot_with_fallback.js --pairing 24165255707');
+                    console.log('   (Gabon: sans le 0 après 241)');
+                }
             }
         } else if (connection === 'open') {
             reconnectAttempts = 0;
@@ -4550,19 +4948,10 @@ sock.ev.on('messages.upsert', async (m) => {
                 await sock.sendMessage(jid, {
                     text: '🎬 *Lien vidéo détecté !*\n\n⏳ Je télécharge la vidéo pour toi...'
                 });
-                // Téléchargement asynchrone avec timeout
-                Promise.race([
-                    downloadVideoFromUrl(videoUrl, sock, jid),
-                    new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Timeout téléchargement')), 60000)
-                    )
-                ]).catch(error => {
+                // Pas de Promise.race/timeout qui coupe : Facebook/YT peuvent dépasser 60s
+                // (un faux "timeout" envoyait un message alors que le DL continuait)
+                downloadVideoFromUrl(videoUrl, sock, jid).catch((error) => {
                     console.error('❌ Erreur téléchargement asynchrone:', error.message);
-                    if (error.message === 'Timeout téléchargement') {
-                        sock.sendMessage(jid, {
-                            text: '⏰ *Téléchargement en cours...*\n\n🔄 Le téléchargement prend plus de temps que prévu. Je continue en arrière-plan !'
-                        }).catch(() => {});
-                    }
                 });
                 return;
             }
@@ -6489,19 +6878,8 @@ sock.ev.on('messages.upsert', async (m) => {
                             await sock.sendMessage(jid, {
                                 text: '🎬 Super ! Je télécharge ta vidéo YouTube, ça va prendre quelques secondes... ⏳'
                             });
-                            
-                            const videoPath = await downloadYouTube(url);
-                            if (videoPath) {
-                                const videoBuffer = fs.readFileSync(videoPath);
-                                await sock.sendMessage(jid, {
-                                    video: videoBuffer
-                                });
-                                fs.unlinkSync(videoPath);
-                            } else {
-                                await sock.sendMessage(jid, {
-                                    text: '😅 Oups ! J\'ai eu un problème avec cette vidéo. Peux-tu vérifier le lien et réessayer ? 🤗'
-                                });
-                            }
+                            // Même moteur Hexaro que le collage de lien (sans toucher TikTok)
+                            await downloadVideoFromUrl(url, sock, jid);
                         } else {
                             await sock.sendMessage(jid, {
                                 text: '😊 Hey ! J\'ai besoin d\'une URL YouTube valide pour télécharger la vidéo !\nExemple: `-yt https://youtube.com/watch?v=...` 🤗'
