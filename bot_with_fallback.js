@@ -468,6 +468,9 @@ const logger = P({ level: 'silent' });
 const messageCache = new Map();
 const CACHE_DURATION = 30000; // 30 secondes
 let reconnectAttempts = 0;
+let isBotStarting = false;
+let isReconnectScheduled = false;
+let activeSocket = null;
 const BOT_STARTUP_UNIX = Math.floor(Date.now() / 1000);
 
 function getMessageTimestampSeconds(msg) {
@@ -3504,12 +3507,27 @@ async function showMenu(sock, jid) {
 ║     moment pour revoir ce menu !     ║
 ╚══════════════════════════════════════╝`;
 
-    // Envoyer la vidéo avec le menu en caption (reconnectés)
-    await sock.sendMessage(jid, {
-        video: { url: './videos/menu.mp4' },
-        caption: menuText,
-        gifPlayback: true
-    });
+    const videoPath = path.join(__dirname, 'videos', 'menu.mp4');
+    try {
+        if (fs.existsSync(videoPath)) {
+            await sock.sendMessage(jid, {
+                video: { url: videoPath },
+                caption: menuText,
+                gifPlayback: true
+            });
+            return;
+        }
+
+        console.warn('⚠️ Menu vidéo introuvable:', videoPath, '→ envoi texte seul');
+        await sock.sendMessage(jid, { text: menuText });
+    } catch (error) {
+        console.error('❌ Erreur envoi menu:', error.message);
+        try {
+            await sock.sendMessage(jid, { text: menuText });
+        } catch (fallbackError) {
+            console.error('❌ Échec fallback menu texte:', fallbackError.message);
+        }
+    }
 }
 
 /**
@@ -4234,6 +4252,17 @@ async function showMenuVideo(sock, jid) {
  * Fonction principale du bot
  */
 async function startBot() {
+    if (isBotStarting) {
+        console.log('⚠️ Démarrage du bot déjà en cours, nouvelle tentative ignorée');
+        return;
+    }
+
+    if (activeSocket) {
+        console.log('⚠️ Une instance du bot est déjà active, nouvelle tentative ignorée');
+        return;
+    }
+
+    isBotStarting = true;
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     const { version, isLatest } = await fetchLatestBaileysVersion();
     
@@ -4252,6 +4281,8 @@ async function startBot() {
         maxMsgRetryCount: 3,
         markOnlineOnConnect: false
     });
+
+    activeSocket = sock;
 
     // Gestion des événements de connexion
     sock.ev.on('connection.update', async (update) => {
@@ -4277,28 +4308,55 @@ async function startBot() {
             
             console.log('Connexion fermée, reconnexion:', shouldReconnect);
             console.log('Détails erreur:', error?.message, 'Code:', statusCode);
+
+            // Libérer le socket mort AVANT toute tentative de reconnexion
+            // (sinon startBot() refuse avec "instance déjà active")
+            try {
+                sock.end?.(undefined);
+            } catch (_) {}
+            if (activeSocket === sock) {
+                activeSocket = null;
+            }
+            isBotStarting = false;
             
-            // Vérifier si c'est une erreur de session corrompue (mais pas lors de la première connexion)
+            // Bad MAC / session cassée : stop (sauf 515 = restartRequired, normal au pairing)
             const isSessionCorrupted = (error?.message?.includes('Bad MAC') || 
                                       error?.message?.includes('session')) &&
-                                     statusCode !== 515; // Code 515 peut être normal lors de la première connexion
+                                     statusCode !== DisconnectReason.restartRequired &&
+                                     statusCode !== 515;
             
             if (isSessionCorrupted) {
                 console.log('🚨 Session corrompue détectée dans le bot principal');
                 console.log('🛑 Arrêt du bot pour éviter les boucles infinies');
-                return; // Ne pas essayer de se reconnecter
+                console.log('💡 Sur le VPS: rm -rf auth_info/* puis rescanner le QR');
+                return;
             }
             
             if (shouldReconnect) {
+                if (isReconnectScheduled) {
+                    console.log('⚠️ Reconnexion déjà planifiée, nouvelle tentative ignorée');
+                    return;
+                }
+
+                isReconnectScheduled = true;
                 reconnectAttempts += 1;
                 const delayMs = Math.min(5000 * reconnectAttempts, MAX_RECONNECT_DELAY_MS);
                 console.log(`🔄 Tentative de reconnexion #${reconnectAttempts} dans ${Math.round(delayMs / 1000)} secondes...`);
                 setTimeout(() => {
-                    startBot();
+                    isReconnectScheduled = false;
+                    startBot().catch((e) => {
+                        console.error('❌ Échec reconnexion:', e.message);
+                        isBotStarting = false;
+                        activeSocket = null;
+                    });
                 }, delayMs);
+            } else {
+                console.log('🚪 Déconnecté (loggedOut) — nouvel scan QR requis');
             }
         } else if (connection === 'open') {
             reconnectAttempts = 0;
+            isReconnectScheduled = false;
+            isBotStarting = false;
             console.log('✅ Connecté à WhatsApp !');
             
             // Message de confirmation au créateur (avec délai pour éviter les erreurs)
