@@ -2097,7 +2097,8 @@ function friendlyMediaFailMessage(platformOrLabel) {
         instagram: 'Reel/post privé, ou compte restreint.',
         pinterest: 'Pin privé ou média introuvable.',
         twitter: 'Post privé, supprimé, ou média indisponible.',
-        x: 'Post privé, supprimé, ou média indisponible.'
+        x: 'Post privé, supprimé, ou média indisponible.',
+        tiktok: 'Vidéo privée, région bloquée, ou lien invalide.'
     };
     const labels = {
         youtube: 'YouTube',
@@ -2105,7 +2106,8 @@ function friendlyMediaFailMessage(platformOrLabel) {
         instagram: 'Instagram',
         pinterest: 'Pinterest',
         twitter: 'X',
-        x: 'X'
+        x: 'X',
+        tiktok: 'TikTok'
     };
     const label = labels[key] || platformOrLabel || 'ce lien';
     const tip = tips[key] || 'Lien privé, expiré, ou temporairement inaccessible.';
@@ -2312,7 +2314,7 @@ async function downloadYouTubeVideo(url, outputPath, sock, jid) {
     } catch (error) {
         console.error('❌ Erreur téléchargement YouTube:', error.message);
         await sock.sendMessage(jid, {
-            text: '❌ *Erreur de téléchargement YouTube*\n\n😅 Désolé, je n\'ai pas pu télécharger cette vidéo YouTube.\n\n🔧 *Détails techniques :* ' + error.message + '\n\n💡 *Conseils :*\n• Vérifie que le lien est correct\n• Assure-toi que la vidéo est accessible\n• Essaie avec une autre vidéo YouTube\n• Certaines vidéos peuvent être bloquées ou nécessiter des outils plus avancés'
+            text: friendlyMediaFailMessage('youtube')
         });
         return null;
     }
@@ -2619,7 +2621,7 @@ async function downloadFacebookVideo(url, outputPath, sock, jid) {
     } catch (error) {
         console.error('❌ Erreur téléchargement Facebook:', error.message);
         await sock.sendMessage(jid, {
-            text: '📘 *Vidéo Facebook détectée !*\n\n🎬 *Lien reçu :* ' + url + '\n\n😅 Désolé, je n\'ai pas pu télécharger cette vidéo Facebook.\n\n🔧 *Erreur :* ' + error.message + '\n\n💡 *Conseils :*\n• Vérifie que le lien est accessible\n• Essaie avec un autre lien Facebook\n• Tu peux partager le lien YouTube de la même vidéo si elle existe !'
+            text: friendlyMediaFailMessage('facebook')
         });
         return null;
     }
@@ -3010,8 +3012,9 @@ async function downloadTikTokVideo(url, outputPath, sock, jid) {
     } catch (error) {
         console.error('❌ Erreur téléchargement TikTok:', error.message);
         await sock.sendMessage(jid, {
-            text: '🎵 *Vidéo TikTok détectée !*\n\n🎬 *Lien reçu :* ' + url + '\n\n😅 Désolé, je n\'ai pas pu télécharger cette vidéo TikTok.\n\n🔧 *Erreur :* ' + error.message + '\n\n💡 *Conseils :*\n• Vérifie que le lien est accessible\n• Essaie avec un autre lien TikTok\n• Tu peux partager le lien YouTube de la même vidéo si elle existe !'
+            text: friendlyMediaFailMessage('tiktok')
         });
+        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
         return null;
     }
 }
@@ -5029,8 +5032,8 @@ sock.ev.on('messages.upsert', async (m) => {
         
         // En mode commandes uniquement, on laisse passer:
         // - les commandes préfixées
-        // - les liens vidéo (TikTok/YouTube/etc.) pour téléchargement auto
-        if (COMMANDS_ONLY_MODE && !isCommandFromText && !isBareVideoOnly) {
+        // - tout message contenant un lien vidéo (inbox + groupes)
+        if (COMMANDS_ONLY_MODE && !isCommandFromText && !isVideoLinkMessage) {
             return;
         }
         
@@ -5159,7 +5162,7 @@ sock.ev.on('messages.upsert', async (m) => {
             shouldRespond = isMentioned || isQuotedBot || isCommand;
         }
         
-        // Vérifier si c'est un lien vidéo (toujours traiter les liens vidéo)
+        // Vérifier si c'est un lien vidéo (inbox ET groupes — sans besoin de mention)
         if (messageText.trim() && detectVideoLink(messageText)) {
             const videoUrl = extractVideoUrl(messageText);
             if (videoUrl) {
@@ -5171,7 +5174,7 @@ sock.ev.on('messages.upsert', async (m) => {
                     console.log('⏳ Lien déjà en cours / cooldown:', videoUrl);
                     return;
                 }
-                console.log('🎬 Lien vidéo détecté:', videoUrl);
+                console.log(`🎬 Lien vidéo détecté (${isGroup ? 'groupe' : 'inbox'}):`, videoUrl);
                 await sock.sendMessage(jid, {
                     text: '🎬 *Lien vidéo détecté !*\n\n⏳ Je télécharge la vidéo pour toi...'
                 });

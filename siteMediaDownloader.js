@@ -1,7 +1,7 @@
 /**
  * Moteur DL multi-plateformes pour le bot (stack Hexaro).
- * Priorité : ce qui marche — API site + fallbacks ciblés.
- * Cobalt local désactivé par défaut (souvent vide / lent sur FB).
+ * Par défaut : UNIQUEMENT l’API site (DOWNLOADER_API_URL).
+ * Fallbacks locaux (yt-dlp…) seulement si SITE_DOWNLOADER_LOCAL_FALLBACK=true.
  * TikTok hors scope (tikwm dans le bot).
  */
 const axios = require('axios');
@@ -457,35 +457,44 @@ async function downloadViaSiteApi(url, outputPath) {
 }
 
 /**
- * Stratégie "ce qui marche" :
- * 1) API site Hexaro
- * 2) Fallback plateforme (yt-dlp / fxtwitter / pinterest) — PAS Cobalt
- * 3) Cobalt local seulement si USE_COBALT_LOCAL=true
+ * Stratégie bot : UNIQUEMENT l’API Hexaro (DOWNLOADER_API_URL).
+ * Les fallbacks locaux (yt-dlp / fxtwitter / Cobalt) sont désactivés —
+ * YouTube / FB / etc. se gèrent côté site Hexaro.
+ * Opt-in secours : SITE_DOWNLOADER_LOCAL_FALLBACK=true
  */
+function useLocalDownloaderFallback() {
+    return String(process.env.SITE_DOWNLOADER_LOCAL_FALLBACK || 'false').toLowerCase() === 'true';
+}
+
 async function downloadSiteMediaToFile(rawUrl, outputPath) {
     const url = sanitizeMediaUrl(rawUrl);
     const platform = detectPlatform(url);
     if (!platform) {
-        throw new Error('Plateforme non supportée par le moteur site');
+        throw new Error('Plateforme non supportée');
     }
 
-    const errors = [];
     const apiBase = getDownloaderApiUrl();
-
-    // 1) Site Hexaro
-    if (apiBase) {
-        try {
-            console.log(`🌐 API site Hexaro (${apiBase})…`);
-            return await downloadViaSiteApi(url, outputPath);
-        } catch (e) {
-            errors.push(`API: ${e.message}`);
-            console.warn('⚠️ API site échec → fallback direct:', e.message);
-        }
-    } else {
-        console.warn('⚠️ DOWNLOADER_API_URL absent — fallbacks directs');
+    if (!apiBase) {
+        throw new Error('DOWNLOADER_API_URL non configuré');
     }
 
-    // 2) Fallbacks qui marchent (sans Cobalt)
+    try {
+        console.log(`🌐 API Hexaro uniquement (${apiBase})…`);
+        return await downloadViaSiteApi(url, outputPath);
+    } catch (e) {
+        const detail = e?.response?.status
+            ? `HTTP ${e.response.status}`
+            : (e.message || 'échec');
+        console.warn('⚠️ API Hexaro échec:', detail, e?.response?.data?.message || e?.response?.data?.error || '');
+        if (!useLocalDownloaderFallback()) {
+            // Message technique uniquement en logs — le bot affiche un texte friendly
+            throw new Error('Échec API Hexaro');
+        }
+        console.warn('⚠️ SITE_DOWNLOADER_LOCAL_FALLBACK=true → tentative locale…');
+    }
+
+    const errors = ['API Hexaro'];
+
     if (platform === 'twitter') {
         try {
             console.log('🐦 fxtwitter…');
@@ -516,7 +525,6 @@ async function downloadSiteMediaToFile(rawUrl, outputPath) {
         }
     }
 
-    // 3) Cobalt local (opt-in seulement)
     if (useCobaltLocal()) {
         try {
             console.log(`⚡ Cobalt local (${getCobaltUrl()})…`);
@@ -527,7 +535,7 @@ async function downloadSiteMediaToFile(rawUrl, outputPath) {
         }
     }
 
-    throw new Error(errors.join(' | ') || 'Téléchargement impossible');
+    throw new Error('Échec téléchargement');
 }
 
 module.exports = {
