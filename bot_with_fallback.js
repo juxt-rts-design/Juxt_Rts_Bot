@@ -1526,7 +1526,7 @@ function isBareVideoLinkOnly(text) {
 /** Réponses internes du bot à ignorer (évite boucle URL dans le message d’erreur). */
 function isBotVideoStatusSpam(text) {
     const t = String(text || '');
-    return /Lien vidéo détecté|Impossible de récupérer ce média|Je télécharge la vidéo|DOWNLOADER_API_URL|yt-dlp|Moteur site Hexaro/i.test(t);
+    return /Lien vidéo détecté|Impossible de récupérer ce média|pas pu récupérer ce média|Je télécharge la vidéo|DOWNLOADER_API_URL|yt-dlp|Moteur site Hexaro|Fichier trop lourd/i.test(t);
 }
 
 /** Anti-boucle : même URL en cours / échec récent. */
@@ -2088,6 +2088,34 @@ async function processAudioTranscription(sock, jid, quotedMsg) {
     }
 }
 
+/** Message user WhatsApp — jamais de détails techniques (API/yt-dlp/stack). */
+function friendlyMediaFailMessage(platformOrLabel) {
+    const key = String(platformOrLabel || '').toLowerCase();
+    const tips = {
+        youtube: 'Vidéo privée, géo-bloquée, ou temporairement indisponible.',
+        facebook: 'Post privé, lien expiré, ou vidéo non publique.',
+        instagram: 'Reel/post privé, ou compte restreint.',
+        pinterest: 'Pin privé ou média introuvable.',
+        twitter: 'Post privé, supprimé, ou média indisponible.',
+        x: 'Post privé, supprimé, ou média indisponible.'
+    };
+    const labels = {
+        youtube: 'YouTube',
+        facebook: 'Facebook',
+        instagram: 'Instagram',
+        pinterest: 'Pinterest',
+        twitter: 'X',
+        x: 'X'
+    };
+    const label = labels[key] || platformOrLabel || 'ce lien';
+    const tip = tips[key] || 'Lien privé, expiré, ou temporairement inaccessible.';
+    return (
+        `😅 Désolé, je n’ai pas pu récupérer ce média *${label}*.\n\n` +
+        `💡 ${tip}\n` +
+        `Essaie un autre lien public, ou réessaie plus tard.`
+    );
+}
+
 /**
  * Télécharge IG / FB / Pinterest / YouTube / X via le moteur Hexaro (site tik-tok).
  * TikTok reste sur downloadTikTokVideo — ne pas mélanger.
@@ -2114,7 +2142,7 @@ async function downloadViaSiteEngine(url, outputPath, sock, jid) {
         const sizeMb = fs.statSync(result.path).size / (1024 * 1024);
         if (sizeMb > 64) {
             await sock.sendMessage(jid, {
-                text: `😅 *Fichier trop lourd (${sizeMb.toFixed(1)} Mo)*\n\nWhatsApp limite la taille. Essaie un autre lien ou une qualité plus courte.`
+                text: `😅 *Fichier trop lourd pour WhatsApp*\n\nEssaie un autre lien ou une version plus courte.`
             });
             safeUnlink(result.path);
             return null;
@@ -2138,12 +2166,10 @@ async function downloadViaSiteEngine(url, outputPath, sock, jid) {
         console.log(`✅ ${label} envoyé via moteur site (${result.source})`);
         return result.path;
     } catch (error) {
+        // Détails techniques uniquement en logs VPS
         console.error(`❌ Moteur site (${label}):`, error.message);
         await sock.sendMessage(jid, {
-            text:
-                `😅 *Impossible de récupérer ce média ${label}*\n\n` +
-                `🔧 ${error.message}\n\n` +
-                `💡 Lien public ? API Hexaro / yt-dlp OK sur le VPS ?`
+            text: friendlyMediaFailMessage(platform || label)
         });
         safeUnlink(outputPath);
         return null;
